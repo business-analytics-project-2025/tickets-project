@@ -4,3 +4,6 @@ transformers
 matplotlib
 sentence-transformers
 hf_xet
+sentencepiece
+tiktoken
+protobuf
