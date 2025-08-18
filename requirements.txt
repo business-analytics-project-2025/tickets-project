@@ -7,3 +7,7 @@ hf_xet
 sentencepiece
 tiktoken
 protobuf
+fastapi
+uvicorn
+requests
+streamlit
