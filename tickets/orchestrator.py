@@ -1,13 +1,24 @@
 # tickets/orchestrator.py
+import os
 import asyncio
 from typing import Dict
 
 from .contracts import FinalPrediction, CombinedPredictionError
-from .agents import IntakeAgent, PreprocessAgent, TagsAgent, DepartmentAgent, TypeAgent, PriorityAgent
+from .agents import (
+    IntakeAgent,
+    PreprocessAgent,
+    TagsAgent,
+    DepartmentAgent,
+    TypeAgent,
+    PriorityAgent,
+)
+from .registry import ensure_loaded
 
-# Tunables
-AGENT_TIMEOUT_SEC = 8.0
+# ---- Tunables ----
+# DeBERTa-v3-large on CPU can exceed 8s; make it configurable.
+AGENT_TIMEOUT_SEC = float(os.getenv("AGENT_TIMEOUT_SEC", "30"))
 RETRY_ONCE = True
+
 
 class Orchestrator:
     def __init__(self):
@@ -15,39 +26,53 @@ class Orchestrator:
         self.pre = PreprocessAgent()
         self.tags = TagsAgent()
         self.dept = DepartmentAgent()
-        self.typ  = TypeAgent()
+        self.typ = TypeAgent()
         self.prio = PriorityAgent()
 
     async def _call_with_retry(self, fn, *args):
+        async def _once():
+            # Run blocking model call in a thread to avoid blocking the event loop
+            return await asyncio.to_thread(fn, *args)
+
         try:
-            return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=AGENT_TIMEOUT_SEC)
-        except Exception as e:
+            return await asyncio.wait_for(_once(), timeout=AGENT_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            # Retry won't help if we already hit the timeout; fail fast with clear message
+            raise RuntimeError("timeout")
+        except Exception:
             if not RETRY_ONCE:
                 raise
-            # one retry
-            return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=AGENT_TIMEOUT_SEC)
+            # One retry (fresh thread)
+            return await asyncio.wait_for(_once(), timeout=AGENT_TIMEOUT_SEC)
 
     async def predict(self, subject: str, body: str) -> FinalPrediction:
-        # Intake + preprocess
+        # Intake + light preprocess (no tokenization here; each agent tokenizes itself)
         ticket = self.intake.handle(subject, body)
-        tokenized = self.pre.handle(ticket)
+        ticket = self.pre.handle(ticket)
+
+        # Ensure all tokenizers/models are fully loaded before parallel calls
+        ensure_loaded()
 
         # Fan-out to specialist agents
-        tasks = [
-            self._call_with_retry(self.tags.handle, tokenized),
-            self._call_with_retry(self.dept.handle, tokenized),
-            self._call_with_retry(self.typ.handle,  tokenized),
-            self._call_with_retry(self.prio.handle, tokenized),
-        ]
+        tasks = {
+            "tags": self._call_with_retry(self.tags.handle, ticket),
+            "department": self._call_with_retry(self.dept.handle, ticket),
+            "type": self._call_with_retry(self.typ.handle, ticket),
+            "priority": self._call_with_retry(self.prio.handle, ticket),
+        }
 
-        # Fail-fast: if any fails, cancel the rest and raise CombinedPredictionError
-        try:
-            a_tags, a_dept, a_type, a_prio = await asyncio.gather(*tasks)
-        except Exception as e:
-            for t in tasks:
-                if isinstance(t, asyncio.Task) and not t.done():
-                    t.cancel()
-            raise CombinedPredictionError("Prediction failed in at least one agent", {"cause": str(e)})
+        # Gather results; do not raise immediately so we can attach which agent failed
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        # Fail-fast with clear agent + cause
+        for (name, _), res in zip(tasks.items(), results):
+            if isinstance(res, Exception):
+                raise CombinedPredictionError(
+                    "agent_failed",
+                    {"agent": name, "cause": str(res)},
+                )
+
+        a_tags, a_dept, a_type, a_prio = results
 
         return FinalPrediction(
             ticket_id=ticket.ticket_id,
@@ -65,9 +90,12 @@ class Orchestrator:
             },
         )
 
-# Convenience wrapper so callers don’t have to write asyncio themselves
+
 def predict_all(subject: str, body: str) -> Dict:
-    """Sync wrapper that runs the orchestrator and returns a plain dict."""
+    """
+    Synchronous convenience wrapper that runs the orchestrator and
+    returns a plain dict for callers (MCP service, tests, etc.).
+    """
     async def _run():
         orch = Orchestrator()
         out = await orch.predict(subject, body)
@@ -81,4 +109,5 @@ def predict_all(subject: str, body: str) -> Dict:
             "priority": out.priority,
             "confidences": out.confidences,
         }
+
     return asyncio.run(_run())

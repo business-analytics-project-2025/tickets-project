@@ -1,19 +1,25 @@
 # tickets/registry.py
 import json
-import torch
-import numpy as np
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
+import torch
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
-from .config import BASE_MODEL, MODEL_ASSETS_DIR, FILES, DEVICE, MAX_LENGTH, USE_FAST, DO_LOWER
+# Per-task model config (backbones, filenames, device, etc.)
+from .config import MODEL_ASSETS_DIR, FILES, DEVICE, USE_FAST, DO_LOWER
 
-# Globals (lazy-loaded)
-_tokenizer = None
-_models: Dict[str, AutoModelForSequenceClassification] = {}
-_labels: Dict[str, List[str]] = {}
+# ---- Globals (lazy, thread-safe) ----
+_tokenizers: Dict[str, AutoTokenizer] = {}  # task -> tokenizer
+_models: Dict[str, AutoModelForSequenceClassification] = {}  # task -> model
+_labels: Dict[str, List[str]] = {}  # task -> label list
 _thresholds: Optional[np.ndarray] = None  # for tags only
+
+_loaded: bool = False
+_load_lock = threading.Lock()
+
 
 def _assets_path(*names) -> Path:
     p = Path(MODEL_ASSETS_DIR, *names)
@@ -21,13 +27,16 @@ def _assets_path(*names) -> Path:
         raise FileNotFoundError(f"Expected asset missing: {p}")
     return p
 
-def get_tokenizer():
-    global _tokenizer
-    if _tokenizer is None:
-        _tokenizer = AutoTokenizer.from_pretrained(
-            BASE_MODEL, use_fast=USE_FAST, do_lower_case=DO_LOWER
+
+def get_tokenizer(task: str) -> AutoTokenizer:
+    """Tokenizer for a given task (loaded from that task's base model)."""
+    if task not in _tokenizers:
+        base = FILES[task]["base_model"]
+        _tokenizers[task] = AutoTokenizer.from_pretrained(
+            base, use_fast=USE_FAST, do_lower_case=DO_LOWER
         )
-    return _tokenizer
+    return _tokenizers[task]
+
 
 def _load_json_list(path: Path) -> List[str]:
     with path.open("r", encoding="utf-8") as f:
@@ -35,6 +44,7 @@ def _load_json_list(path: Path) -> List[str]:
     if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
         raise ValueError(f"Labels file must be a list[str]: {path}")
     return data
+
 
 def _load_thresholds(path: Path) -> np.ndarray:
     with path.open("r", encoding="utf-8") as f:
@@ -44,55 +54,76 @@ def _load_thresholds(path: Path) -> np.ndarray:
         raise ValueError(f"Thresholds must be 1-D list/array: {path}")
     return arr
 
+
 def _load_model(task: str, num_labels: int, multilabel: bool, weights_path: Path):
+    """Instantiate the correct backbone per task and load fine-tuned head weights."""
+    base = FILES[task]["base_model"]
     cfg = AutoConfig.from_pretrained(
-        BASE_MODEL,
+        base,
         num_labels=num_labels,
         problem_type="multi_label_classification" if multilabel else "single_label_classification",
     )
-    model = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL, config=cfg)
+    model = AutoModelForSequenceClassification.from_pretrained(base, config=cfg)
     state = torch.load(weights_path, map_location="cpu")
+    # strict=True because we normalized all checkpoints to the right backbone
     model.load_state_dict(state, strict=True)
     model.to(DEVICE)
     model.eval()
     return model
 
+
 def ensure_loaded():
-    """Load tokenizer, labels, thresholds (tags), and all four models once."""
-    global _thresholds
+    """Load labels, thresholds (tags), tokenizers, and all four models once (thread-safe)."""
+    global _thresholds, _loaded
 
-    # Tokenizer
-    get_tokenizer()
+    if _loaded:
+        return
 
-    # Tasks
-    for task, spec in FILES.items():
-        labels_path  = _assets_path(spec["labels"])
-        labels       = _load_json_list(labels_path)
-        _labels[task] = labels
+    with _load_lock:
+        if _loaded:
+            return
 
-        weights_path = _assets_path(spec["weights"])
-        model        = _load_model(task, num_labels=len(labels), multilabel=spec["multilabel"], weights_path=weights_path)
-        _models[task] = model
+        # 1) Labels and tokenizers
+        for task, spec in FILES.items():
+            labels_path = _assets_path(spec["labels"])
+            _labels[task] = _load_json_list(labels_path)
+            # touch tokenizer so it is ready for parallel calls
+            get_tokenizer(task)
 
-    # Per-tag thresholds (tags only)
-    tags_extra = FILES["tags"]["extra"]
-    if tags_extra:
-        thresh_path = _assets_path(tags_extra)
-        _thresholds = _load_thresholds(thresh_path)
+        # 2) Models
+        for task, spec in FILES.items():
+            weights_path = _assets_path(spec["weights"])
+            _models[task] = _load_model(
+                task,
+                num_labels=len(_labels[task]),
+                multilabel=spec["multilabel"],
+                weights_path=weights_path,
+            )
 
-    # Sanity: thresholds length matches labels
-    if _thresholds is not None and len(_thresholds) != len(_labels["tags"]):
-        raise ValueError("Length mismatch: tags thresholds vs tags labels")
+        # 3) Per-tag thresholds (tags only)
+        tags_extra = FILES["tags"].get("extra")
+        if tags_extra:
+            thresh_path = _assets_path(tags_extra)
+            _thresholds = _load_thresholds(thresh_path)
+
+        # 4) Sanity checks
+        if _thresholds is not None and len(_thresholds) != len(_labels["tags"]):
+            raise ValueError("Length mismatch: tags thresholds vs tags labels")
+
+        _loaded = True
+
 
 def get_model(task: str):
     if task not in _models:
         ensure_loaded()
     return _models[task]
 
+
 def get_labels(task: str) -> List[str]:
     if task not in _labels:
         ensure_loaded()
     return _labels[task]
+
 
 def get_thresholds() -> Optional[np.ndarray]:
     if _thresholds is None:
