@@ -13,7 +13,13 @@ from typing import Dict
 from .orchestrator import predict_all as orchestrator_predict_all
 from .contracts import CombinedPredictionError
 from .duplicate_check import dedupe, remember
-from .clickup_client import create_task, add_tags, set_dropdown_value
+from .clickup_client import (
+    create_task,
+    add_tags,
+    set_dropdown_value,
+    append_tags_note,
+    append_field_note,
+)
 from .config import PRIORITY_TO_CLICKUP
 
 # ClickUp custom field IDs for your List:
@@ -37,7 +43,6 @@ def submit_ticket(subject: str, body: str) -> Dict:
     try:
         pred = orchestrator_predict_all(subject, body)
     except CombinedPredictionError as e:
-        # e.detail may include {"agent": "...", "cause": "..."}
         return {"ok": False, "reason": f"prediction_failed: {e.detail or str(e)}"}
     except Exception as e:
         return {"ok": False, "reason": f"prediction_failed: {e}"}
@@ -46,33 +51,48 @@ def submit_ticket(subject: str, body: str) -> Dict:
     priority_str = (pred.get("priority") or "").strip()
     priority_num = PRIORITY_TO_CLICKUP.get(priority_str, 3)
 
-    # 3) Create task + set custom fields + tags
+    # 3) Create task
     try:
         name = (subject or "").strip() or "(no subject)"
         desc = (body or "").strip()
-
         task = create_task(name=name, description=desc, priority_num=priority_num)
         task_id = task["id"]
+    except Exception as e:
+        return {"ok": False, "reason": f"clickup_failed: create_task: {e}"}
 
-        # Type (dropdown) — auto-add option if missing
+    # 4) Set dropdowns (strict match to existing options; append note when fuzzy)
+    try:
         tval = (pred.get("type") or "").strip()
         if tval:
-            set_dropdown_value(task_id, TYPE_FIELD_ID, tval)
+            _, exact, chosen_name, _ = set_dropdown_value(task_id, TYPE_FIELD_ID, tval)
+            if not exact:
+                append_field_note(task_id, "Type", tval, chosen_name)
+    except Exception as e:
+        return {"ok": False, "reason": f"clickup_failed: type_set: {e}"}
 
-        # Department (dropdown) — auto-add option if missing
+    try:
         dval = (pred.get("department") or "").strip()
         if dval:
-            set_dropdown_value(task_id, DEPT_FIELD_ID, dval)
+            _, exact, chosen_name, _ = set_dropdown_value(task_id, DEPT_FIELD_ID, dval)
+            if not exact:
+                append_field_note(task_id, "Department", dval, chosen_name)
+    except Exception as e:
+        return {"ok": False, "reason": f"clickup_failed: department_set: {e}"}
 
-        # Tags (multi-label) — auto-create if missing
+    # 5) Tags (best-effort; record in description if attach fails)
+    try:
         tags = pred.get("tags") or []
         if tags:
-            add_tags(task_id, tags)
-
+            failed = add_tags(task_id, tags)
+            if failed:
+                append_tags_note(task_id, failed)
     except Exception as e:
-        return {"ok": False, "reason": f"clickup_failed: {e}"}
+        # Don't fail the entire submission because of tags; just note it.
+        # If you want strict behavior, change this to: return {"ok": False, "reason": f"clickup_failed: tags: {e}"}
+        append_tags_note(task_id, tags or [])
+        # continue
 
-    # 4) Remember hash to block duplicates next time
+    # 6) Remember hash to block duplicates next time
     remember(h)
 
     return {"ok": True, "task_id": task_id, "task_url": task.get("url", "")}

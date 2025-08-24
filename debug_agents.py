@@ -2,8 +2,8 @@
 from tickets.agents import IntakeAgent, PreprocessAgent, TagsAgent, DepartmentAgent, TypeAgent, PriorityAgent
 
 if __name__ == "__main__":
-    subject = "SSO login fails intermittently"
-    body = "Users get redirected back to login. Started after yesterday's update."
+    subject = "SSO login failing for multiple users (urgent)"
+    body = "After last update, SSO redirects back to login. Affects 30+ users. Please investigate."
 
     intake = IntakeAgent()
     pre = PreprocessAgent()
