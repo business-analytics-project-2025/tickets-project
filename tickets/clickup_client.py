@@ -10,7 +10,6 @@ import requests
 
 BASE = "https://api.clickup.com/api/v2"
 
-
 # ---------- HTTP helper & errors ----------
 
 def _get_headers() -> Dict[str, str]:
@@ -135,6 +134,8 @@ def update_task_description(task_id: str, new_description: str) -> dict:
 
 # ---------- Dropdowns: matching + robust write + read-back verification ----------
 
+_FIELD_CACHE: dict[str, dict] = {}
+
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[_\-\s]+", " ", s)
@@ -151,12 +152,20 @@ def _get_list_fields() -> dict:
     return _req("GET", url)
 
 def _find_dropdown(field_id: str) -> dict:
+    global _FIELD_CACHE
+    if field_id in _FIELD_CACHE:
+        return _FIELD_CACHE[field_id]
+
     data = _get_list_fields()
     field = next((f for f in data.get("fields", []) if f.get("id") == field_id), None)
     if not field:
-        raise ClickUpHTTPError("Field not attached to list", url=f"{BASE}/list/{_get_list_id()}/field", resp_text=str(data))
+        raise ClickUpHTTPError("Field not attached to list",
+                               url=f"{BASE}/list/{_get_list_id()}/field",
+                               resp_text=str(data))
     if field.get("type") != "drop_down":
         raise ClickUpHTTPError("Field is not drop_down", resp_text=str(field))
+
+    _FIELD_CACHE[field_id] = field
     return field
 
 def _dropdown_options(field_id: str) -> List[dict]:
