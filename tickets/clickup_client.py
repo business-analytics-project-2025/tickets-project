@@ -1,113 +1,439 @@
 # tickets/clickup_client.py
-import os, hashlib, requests
-from typing import Dict, List, Optional
+from __future__ import annotations
+
+import os
+import re
+from difflib import SequenceMatcher
+from typing import Dict, List, Optional, Tuple, Any
+
+import requests
 
 BASE = "https://api.clickup.com/api/v2"
-CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
-CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID", "901514139552")  # your list
-CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "90151452884")   # your team
 
-HEADERS = {
-    "Authorization": CLICKUP_TOKEN or "",
-    "Content-Type": "application/json",
-}
+# ---------- HTTP helper & errors ----------
 
-class ClickUpError(RuntimeError):
-    pass
+def _get_headers() -> Dict[str, str]:
+    token = os.environ.get("CLICKUP_TOKEN")
+    if not token:
+        raise RuntimeError("CLICKUP_TOKEN is not set in environment")
+    return {"Authorization": token, "Content-Type": "application/json"}
 
-def _check_token():
-    if not CLICKUP_TOKEN:
-        raise ClickUpError("CLICKUP_TOKEN is not set in env.")
 
-def _raise_for_status(r: requests.Response):
+class ClickUpHTTPError(RuntimeError):
+    def __init__(
+        self,
+        msg: str,
+        *,
+        status: Optional[int] = None,
+        url: Optional[str] = None,
+        payload: Optional[dict] = None,
+        resp_text: Optional[str] = None,
+    ):
+        super().__init__(msg)
+        self.status = status
+        self.url = url
+        self.payload = payload
+        self.resp_text = resp_text
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        parts = []
+        if self.status is not None:
+            parts.append(f"status={self.status}")
+        if self.url:
+            parts.append(f"url={self.url}")
+        if self.payload is not None:
+            parts.append(f"payload={self.payload}")
+        if self.resp_text:
+            trimmed = self.resp_text if len(self.resp_text) < 2000 else self.resp_text[:2000] + "…"
+            parts.append(f"resp={trimmed}")
+        return base + (" [" + " | ".join(parts) + "]" if parts else "")
+
+
+def _req(method: str, url: str, json: Optional[dict] = None, params: Optional[dict] = None) -> dict:
+    r = requests.request(method, url, headers=_get_headers(), json=json, params=params, timeout=30)
+    if r.status_code // 100 != 2:
+        raise ClickUpHTTPError(
+            f"HTTP {r.status_code} {method} {url}",
+            status=r.status_code, url=url, payload=json, resp_text=r.text
+        )
     try:
-        r.raise_for_status()
-    except Exception as e:
-        raise ClickUpError(f"{r.status_code} {r.text}") from e
+        return r.json() if r.text else {}
+    except Exception:
+        return {}
 
-def ensure_workspace_tag(name: str):
-    """Create a workspace tag if missing (idempotent)."""
-    _check_token()
-    # ClickUp 'create tag' payload shape:
-    r = requests.post(
-        f"{BASE}/team/{CLICKUP_TEAM_ID}/tag",
-        headers=HEADERS,
-        json={"tag": {"name": name}},
-        timeout=15,
+
+# ---------- Env helpers ----------
+
+def _get_list_id() -> str:
+    v = os.environ.get("CLICKUP_LIST_ID")
+    if not v:
+        raise RuntimeError("CLICKUP_LIST_ID is not set in environment")
+    return v
+
+def _get_team_id() -> str:
+    # kept for completeness; not used for tags anymore
+    v = os.environ.get("CLICKUP_TEAM_ID")
+    if not v:
+        raise RuntimeError("CLICKUP_TEAM_ID is not set in environment")
+    return v
+
+
+# ---------- IDs discovery (Space for this List) ----------
+
+_SPACE_ID_CACHE: Optional[str] = None
+
+def _get_space_id_for_list() -> str:
+    """
+    Resolve and cache Space ID for the configured List.
+    GET /list/{list_id} → {'space': {'id': ...}} (or nested under 'list')
+    """
+    global _SPACE_ID_CACHE
+    if _SPACE_ID_CACHE:
+        return _SPACE_ID_CACHE
+    list_id = _get_list_id()
+    url = f"{BASE}/list/{list_id}"
+    data = _req("GET", url)
+    space_id = (
+        (data.get("space") or {}).get("id")
+        or ((data.get("list") or {}).get("space") or {}).get("id")
     )
-    if r.status_code not in (200, 409):  # 409 means already exists
-        _raise_for_status(r)
+    if not space_id:
+        raise ClickUpHTTPError("Could not resolve space.id from List", url=url, resp_text=str(data))
+    _SPACE_ID_CACHE = str(space_id)
+    return _SPACE_ID_CACHE
 
-def add_tags(task_id: str, tags: List[str]):
-    """Attach tags to a task, auto-creating unknown ones."""
-    _check_token()
-    for t in tags:
-        r = requests.post(f"{BASE}/task/{task_id}/tag/{t}", headers=HEADERS, timeout=15)
-        if r.status_code == 404:
-            ensure_workspace_tag(t)
-            r = requests.post(f"{BASE}/task/{task_id}/tag/{t}", headers=HEADERS, timeout=15)
-        _raise_for_status(r)
 
-def create_task(name: str, description: str, priority_num: int) -> Dict:
-    """Create a task in your list; returns {'id':..., 'url':...}."""
-    _check_token()
-    r = requests.post(
-        f"{BASE}/list/{CLICKUP_LIST_ID}/task",
-        headers=HEADERS,
-        json={"name": name, "description": description, "priority": priority_num},
-        timeout=20,
+# ---------- Public helpers ----------
+
+def list_fields() -> dict:
+    """Return field metadata for the current List (debug/ops helper)."""
+    list_id = _get_list_id()
+    url = f"{BASE}/list/{list_id}/field"
+    return _req("GET", url)
+
+def create_task(name: str, description: str, priority_num: int) -> dict:
+    """
+    Create a task on the configured List.
+    priority: 1 urgent, 2 high, 3 normal, 4 low.
+    Returns the task JSON (expects 'id' and 'url').
+    """
+    list_id = _get_list_id()
+    url = f"{BASE}/list/{list_id}/task"
+    payload = {"name": name, "description": description, "priority": priority_num}
+    return _req("POST", url, json=payload)
+
+def get_task(task_id: str) -> dict:
+    url = f"{BASE}/task/{task_id}"
+    return _req("GET", url)
+
+def update_task_description(task_id: str, new_description: str) -> dict:
+    url = f"{BASE}/task/{task_id}"
+    return _req("PUT", url, json={"description": new_description})
+
+
+# ---------- Dropdowns: matching + robust write + read-back verification ----------
+
+_FIELD_CACHE: dict[str, dict] = {}
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[_\-\s]+", " ", s)
+    s = re.sub(r"[^\w\s]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+def _get_list_fields() -> dict:
+    list_id = _get_list_id()
+    url = f"{BASE}/list/{list_id}/field"
+    return _req("GET", url)
+
+def _find_dropdown(field_id: str) -> dict:
+    global _FIELD_CACHE
+    if field_id in _FIELD_CACHE:
+        return _FIELD_CACHE[field_id]
+
+    data = _get_list_fields()
+    field = next((f for f in data.get("fields", []) if f.get("id") == field_id), None)
+    if not field:
+        raise ClickUpHTTPError("Field not attached to list",
+                               url=f"{BASE}/list/{_get_list_id()}/field",
+                               resp_text=str(data))
+    if field.get("type") != "drop_down":
+        raise ClickUpHTTPError("Field is not drop_down", resp_text=str(field))
+
+    _FIELD_CACHE[field_id] = field
+    return field
+
+def _dropdown_options(field_id: str) -> List[dict]:
+    field = _find_dropdown(field_id)
+    return field.get("type_config", {}).get("options", []) or []
+
+def _option_index_for(field_id: str, option_id: str) -> Optional[int]:
+    opts = _dropdown_options(field_id)
+    for i, opt in enumerate(opts):
+        if str(opt.get("id")) == str(option_id):
+            if "orderindex" in opt and isinstance(opt["orderindex"], int):
+                return int(opt["orderindex"])
+            return i
+    return None
+
+def _option_label_for(field_id: str, option_id: str) -> Optional[str]:
+    opts = _dropdown_options(field_id)
+    for opt in opts:
+        if str(opt.get("id")) == str(option_id):
+            return (opt.get("name") or "").strip()
+    return None
+
+def _match_dropdown_option(field_id: str, value_name: str, similarity_threshold: float = 0.78) -> Tuple[str, str, bool]:
+    """
+    Map a predicted string to an existing dropdown option.
+    Returns: (option_id, chosen_display_name, is_exact)
+    If nothing reasonable is found, returns empty option_id (caller decides how to handle).
+    """
+    field = _find_dropdown(field_id)
+    options = field.get("type_config", {}).get("options", []) or []
+    names = [(opt.get("name") or "").strip() for opt in options]
+    ids   = [opt.get("id") for opt in options]
+
+    wanted_raw  = (value_name or "").strip()
+    wanted_norm = _norm(wanted_raw)
+
+    # 1) case-insensitive exact
+    for i, n in enumerate(names):
+        if n.lower() == wanted_raw.lower() and ids[i]:
+            return ids[i], names[i], True
+
+    # 2) normalized exact
+    norm_to_idx = {_norm(n): i for i, n in enumerate(names)}
+    if wanted_norm in norm_to_idx:
+        i = norm_to_idx[wanted_norm]
+        if ids[i]:
+            return ids[i], names[i], True
+
+    # 3) fuzzy
+    best_i, best_sim = -1, 0.0
+    for i, n in enumerate(names):
+        sim = _similar(_norm(n), wanted_norm)
+        if sim > best_sim:
+            best_sim, best_i = sim, i
+    if best_i >= 0 and best_sim >= similarity_threshold and ids[best_i]:
+        return ids[best_i], names[best_i], False
+
+    # 4) give up — explicit failure (no auto-create)
+    return "", wanted_raw, False
+
+def _set_dropdown_value_payloads(task_id: str, field_id: str, option_id: str, option_label: str) -> dict:
+    """
+    Try every known write strategy with every known value shape:
+      endpoints:
+        - POST /task/{id}/field/{field_id}
+        - PUT  /task/{id}/field/{field_id}
+        - PUT  /task/{id}   (custom_fields array)
+      value shapes:
+        - id          (string)
+        - {"id": id}  (object)
+        - index       (integer)
+        - label       (string display name)
+        - {"label": label}
+    """
+    field_url = f"{BASE}/task/{task_id}/field/{field_id}"
+    task_url  = f"{BASE}/task/{task_id}"
+
+    idx = _option_index_for(field_id, option_id)
+
+    value_shapes: List[dict] = []
+    value_shapes.append({"value": option_id})
+    value_shapes.append({"value": {"id": option_id}})
+    if idx is not None:
+        value_shapes.append({"value": idx})
+    if option_label:
+        value_shapes.append({"value": option_label})
+        value_shapes.append({"value": {"label": option_label}})
+
+    attempts: List[Tuple[str, str, dict]] = []
+    for payload in value_shapes:
+        attempts.append(("POST", field_url, payload))
+        attempts.append(("PUT",  field_url, payload))
+        # full-task update form
+        attempts.append(("PUT",  task_url, {"custom_fields": [{"id": field_id, **payload}]}))
+
+    last_err: Optional[ClickUpHTTPError] = None
+    for method, url, payload in attempts:
+        try:
+            return _req(method, url, json=payload)
+        except ClickUpHTTPError as e:
+            last_err = e
+            continue
+
+    raise ClickUpHTTPError(
+        "Failed to set dropdown after all endpoint/payload strategies",
+        status=(last_err.status if last_err else None),
+        url=(last_err.url if last_err else field_url),
+        payload={"tried": [{"method": m, "url": u, "payload": p} for (m, u, p) in attempts]},
+        resp_text=(last_err.resp_text if last_err else None),
     )
-    _raise_for_status(r)
-    data = r.json()
-    return {"id": data["id"], "url": data.get("url", "")}
 
-def list_fields(list_id: Optional[str] = None) -> Dict:
-    _check_token()
-    lid = list_id or CLICKUP_LIST_ID
-    r = requests.get(f"{BASE}/list/{lid}/field", headers=HEADERS, timeout=15)
-    _raise_for_status(r)
-    return r.json()
+def _read_dropdown_value(task_id: str, field_id: str) -> Optional[Any]:
+    """
+    Return the current stored value for this dropdown on the task:
+      - may be option id (string)
+      - may be numeric index (int)
+      - may be object with id or label
+      - may be label string in some tenants
+    """
+    task = get_task(task_id)
+    for cf in task.get("custom_fields", []) or []:
+        if str(cf.get("id")) == str(field_id):
+            val = cf.get("value")
+            if isinstance(val, dict):
+                return val.get("id") or val.get("label") or val.get("value")
+            return val
+    return None
 
-def _get_dropdown_options(field_id: str) -> Dict[str, str]:
-    """Return name->id map of existing dropdown options."""
-    fields = list_fields()
-    opts = {}
-    for f in fields.get("fields", []):
-        if f.get("id") == field_id and f.get("type") == "drop_down":
-            for o in f.get("type_config", {}).get("options", []):
-                opts[o["name"]] = o["id"]
-    return opts
+def set_dropdown_value(task_id: str, field_id: str, value_name: str) -> Tuple[dict, bool, str, str]:
+    """
+    Match predicted value to an existing option, write it using robust strategies,
+    and verify by accepting id OR index OR label on read-back.
+    Returns: (resp_json, is_exact, chosen_display_name, chosen_option_id)
+    Raises ClickUpHTTPError if we can't match or if persistence fails.
+    """
+    opt_id, chosen_name, exact = _match_dropdown_option(field_id, value_name)
+    if not opt_id:
+        raise ClickUpHTTPError(
+            f"No matching option for '{value_name}' on field {field_id}",
+            payload={"predicted": value_name}
+        )
 
-def ensure_dropdown_option(field_id: str, option_name: str) -> str:
-    """Ensure a dropdown option exists; create and return its option id."""
-    _check_token()
-    options = _get_dropdown_options(field_id)
-    if option_name in options:
-        return options[option_name]
-    # Add option
-    r = requests.post(
-        f"{BASE}/field/{field_id}/option",
-        headers=HEADERS,
-        json={"name": option_name},
-        timeout=15,
+    label = _option_label_for(field_id, opt_id) or chosen_name
+    resp = _set_dropdown_value_payloads(task_id, field_id, opt_id, label)
+
+    # --- read-back verification (accept id / index / label) ---
+    persisted = _read_dropdown_value(task_id, field_id)
+
+    # Accept exact id
+    if persisted is not None and str(persisted) == str(opt_id):
+        return resp, exact, chosen_name, opt_id
+
+    # Accept numeric index
+    if isinstance(persisted, int):
+        expected_idx = _option_index_for(field_id, opt_id)
+        if expected_idx is not None and int(persisted) == int(expected_idx):
+            return resp, exact, chosen_name, opt_id
+
+    # Accept label
+    if isinstance(persisted, str) and persisted.strip().lower() == (label or "").strip().lower():
+        return resp, exact, chosen_name, opt_id
+
+    if isinstance(persisted, dict):
+        pid = persisted.get("id")
+        plabel = (persisted.get("label") or persisted.get("value") or "").strip()
+        if (pid and str(pid) == str(opt_id)) or (plabel and plabel.lower() == (label or "").lower()):
+            return resp, exact, chosen_name, opt_id
+
+    raise ClickUpHTTPError(
+        "Dropdown write returned 2xx but value not persisted",
+        url=f"{BASE}/task/{task_id}",
+        payload={
+            "field_id": field_id,
+            "expected_option_id": opt_id,
+            "expected_label": label,
+            "expected_index": _option_index_for(field_id, opt_id),
+            "read_back_value": persisted,
+        },
     )
-    _raise_for_status(r)
-    new_opt = r.json()
-    return new_opt["id"]
 
-def set_dropdown_value(task_id: str, field_id: str, option_name: str):
-    """Set a dropdown custom field; auto-add option if missing."""
-    opt_id = ensure_dropdown_option(field_id, option_name)
-    r = requests.post(
-        f"{BASE}/task/{task_id}/field/{field_id}",
-        headers=HEADERS,
-        json={"value": opt_id},
-        timeout=15,
-    )
-    _raise_for_status(r)
 
-def task_exists_with_hash(hash_str: str) -> bool:
-    """Optional: quick client-side cache; real ClickUp search can be added later."""
-    # For first iteration, we rely on a local cache approach (see duplicate_check.py).
-    # If you want API-based search, we can implement a 'GET /team/{team_id}/task' filter later.
-    return False
+# ---------- Tags: ensure in Space, attach to task (best-effort) ----------
+
+def _ensure_space_tag(tag_name: str) -> None:
+    """
+    Ensure a tag exists at the **Space** level for the List's Space.
+    """
+    space_id = _get_space_id_for_list()
+    url = f"{BASE}/space/{space_id}/tag"
+
+    last_err: Optional[ClickUpHTTPError] = None
+    # Try both payload shapes seen across deployments
+    for payload in ({"tag": {"name": tag_name}}, {"name": tag_name}):
+        try:
+            _req("POST", url, json=payload)  # many deployments 2xx on "already exists"
+            return
+        except ClickUpHTTPError as e:
+            if e.status in (400, 409, 422):
+                return
+            last_err = e
+            continue
+
+    if last_err is not None:
+        raise last_err
+
+def add_tags(task_id: str, tags: List[str]) -> List[str]:
+    """
+    Ensure tags exist at Space scope, then attach each to the task.
+    Returns: list of tags that could NOT be attached (for description fallback).
+    """
+    failed: List[str] = []
+    for tag in tags or []:
+        tag = (tag or "").strip()
+        if not tag:
+            continue
+
+        # Ensure exists in Space
+        try:
+            _ensure_space_tag(tag)
+        except ClickUpHTTPError:
+            failed.append(tag)
+            continue
+
+        # Try path form: POST /task/{task_id}/tag/{tag}
+        try:
+            url1 = f"{BASE}/task/{task_id}/tag/{tag}"
+            _req("POST", url1)
+            continue  # success
+        except ClickUpHTTPError as e1:
+            if e1.status not in (404, 405):
+                failed.append(tag)
+                continue
+
+        # Body form: POST /task/{task_id}/tag  {"tags": ["..."]}
+        try:
+            url2 = f"{BASE}/task/{task_id}/tag"
+            _req("POST", url2, json={"tags": [tag]})
+        except ClickUpHTTPError as e2:
+            if e2.status not in (400, 404, 405, 409, 422):
+                failed.append(tag)
+            else:
+                failed.append(tag)
+
+    return failed
+
+
+# ---------- Description helpers (visibility fallbacks) ----------
+
+def append_tags_note(task_id: str, tags: List[str]) -> None:
+    """Append a 'Predicted tags (ML): …' note at the end of the description."""
+    tags = [t for t in (tags or []) if t]
+    if not tags:
+        return
+    task = get_task(task_id)
+    desc = (task.get("description") or "").rstrip()
+    note = "\n\n---\n**Predicted tags (ML):** " + ", ".join(sorted(set(tags)))
+    new_desc = (desc + note) if desc else note.lstrip()
+    update_task_description(task_id, new_desc)
+
+def append_field_note(task_id: str, field_label: str, predicted_value: str, chosen_value: str) -> None:
+    """
+    Append a one-liner to the task description explaining the dropdown match.
+    """
+    predicted_value = (predicted_value or "").strip()
+    if not predicted_value:
+        return
+    task = get_task(task_id)
+    desc = (task.get("description") or "").rstrip()
+    note = f'\n\n---\n**Predicted {field_label}:** "{predicted_value}" → set to **{chosen_value}**'
+    new_desc = (desc + note) if desc else note.lstrip()
+    update_task_description(task_id, new_desc)

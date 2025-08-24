@@ -1,23 +1,30 @@
 # tickets/service_submit.py
 """
-Service entrypoints that can be called by an MCP server or any Python client.
+Service entrypoints callable by the MCP server (or tests).
 
 submit_ticket(subject, body) -> dict
-  - fail-fast: if any model/agent fails, returns {ok: False, reason: "..."} and does NOT create a task
-  - duplicate block: hash(subject||body); return {ok: False, reason: "duplicate"} if seen within TTL
-  - on success: creates ClickUp task, sets priority, type, department, tags; returns {ok: True, task_id, task_url}
+  - Fail-fast: if ANY classifier agent fails, returns {ok: False, reason: "..."} and DOES NOT create a task
+  - Duplicate block: hash(subject || body); returns {ok: False, reason: "duplicate"} if seen recently
+  - On success: creates ClickUp task, sets priority, type, department, tags; returns {ok: True, task_id, task_url}
 """
 
 from typing import Dict
 
 from .orchestrator import predict_all as orchestrator_predict_all
+from .contracts import CombinedPredictionError
 from .duplicate_check import dedupe, remember
-from .clickup_client import create_task, add_tags, set_dropdown_value
+from .clickup_client import (
+    create_task,
+    add_tags,
+    set_dropdown_value,
+    append_tags_note,
+    append_field_note,
+)
 from .config import PRIORITY_TO_CLICKUP
 
-# ClickUp custom field IDs you provided
-TYPE_FIELD_ID  = "660e1b3b-ec41-40a6-9863-979e44951c70"
-DEPT_FIELD_ID  = "90647e3f-2209-4d5c-be47-7780a883ac28"
+# ClickUp custom field IDs for your List:
+TYPE_FIELD_ID = "660e1b3b-ec41-40a6-9863-979e44951c70"
+DEPT_FIELD_ID = "90647e3f-2209-4d5c-be47-7780a883ac28"
 
 def submit_ticket(subject: str, body: str) -> Dict:
     """
@@ -27,48 +34,65 @@ def submit_ticket(subject: str, body: str) -> Dict:
       {"ok": True, "task_id": "...", "task_url": "..."} on success
       {"ok": False, "reason": "duplicate" | "prediction_failed:..." | "clickup_failed:..."} on failure
     """
-    # Duplicate block
+    # 0) Duplicate block
     is_dup, h = dedupe(subject, body)
     if is_dup:
         return {"ok": False, "reason": "duplicate"}
 
-    # Predict (fail fast, no partials allowed)
+    # 1) Predict (fail-fast; surface the failing agent when possible)
     try:
         pred = orchestrator_predict_all(subject, body)
+    except CombinedPredictionError as e:
+        return {"ok": False, "reason": f"prediction_failed: {e.detail or str(e)}"}
     except Exception as e:
         return {"ok": False, "reason": f"prediction_failed: {e}"}
 
-    # Map priority to ClickUp numeric
-    priority_num = PRIORITY_TO_CLICKUP.get(pred.get("priority", ""), 3)
+    # 2) Map priority string -> ClickUp numeric (default Medium=3)
+    priority_str = (pred.get("priority") or "").strip()
+    priority_num = PRIORITY_TO_CLICKUP.get(priority_str, 3)
 
-    # Create task + set fields/tags (auto-create options and tags as needed)
+    # 3) Create task
     try:
-        subject_safe = (subject or "").strip() or "(no subject)"
-        body_safe    = (body or "").strip()
-
-        task = create_task(
-            name=subject_safe,
-            description=body_safe,
-            priority_num=priority_num
-        )
+        name = (subject or "").strip() or "(no subject)"
+        desc = (body or "").strip()
+        task = create_task(name=name, description=desc, priority_num=priority_num)
         task_id = task["id"]
+    except Exception as e:
+        return {"ok": False, "reason": f"clickup_failed: create_task: {e}"}
 
-        # Custom dropdowns: Type & Department (auto-add option if missing)
-        type_val = pred.get("type") or ""
-        dept_val = pred.get("department") or ""
-        if type_val:
-            set_dropdown_value(task_id, TYPE_FIELD_ID, type_val)
-        if dept_val:
-            set_dropdown_value(task_id, DEPT_FIELD_ID, dept_val)
+    # 4) Set dropdowns (strict match to existing options; append note when fuzzy)
+    try:
+        tval = (pred.get("type") or "").strip()
+        if tval:
+            _, exact, chosen_name, _ = set_dropdown_value(task_id, TYPE_FIELD_ID, tval)
+            if not exact:
+                append_field_note(task_id, "Type", tval, chosen_name)
+    except Exception as e:
+        return {"ok": False, "reason": f"clickup_failed: type_set: {e}"}
 
-        # Tags (multi-label): auto-create if missing
+    try:
+        dval = (pred.get("department") or "").strip()
+        if dval:
+            _, exact, chosen_name, _ = set_dropdown_value(task_id, DEPT_FIELD_ID, dval)
+            if not exact:
+                append_field_note(task_id, "Department", dval, chosen_name)
+    except Exception as e:
+        return {"ok": False, "reason": f"clickup_failed: department_set: {e}"}
+
+    # 5) Tags (best-effort; record in description if attach fails)
+    try:
         tags = pred.get("tags") or []
         if tags:
-            add_tags(task_id, tags)
-
+            failed = add_tags(task_id, tags)
+            if failed:
+                append_tags_note(task_id, failed)
     except Exception as e:
-        return {"ok": False, "reason": f"clickup_failed: {e}"}
+        # Don't fail the entire submission because of tags; just note it.
+        # If you want strict behavior, change this to: return {"ok": False, "reason": f"clickup_failed: tags: {e}"}
+        append_tags_note(task_id, tags or [])
+        # continue
 
-    # Remember hash after success to block duplicates next time
+    # 6) Remember hash to block duplicates next time
     remember(h)
+
     return {"ok": True, "task_id": task_id, "task_url": task.get("url", "")}
