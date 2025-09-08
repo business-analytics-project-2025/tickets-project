@@ -18,7 +18,6 @@ def _get_headers() -> Dict[str, str]:
         raise RuntimeError("CLICKUP_TOKEN is not set in environment")
     return {"Authorization": token, "Content-Type": "application/json"}
 
-
 class ClickUpHTTPError(RuntimeError):
     def __init__(
         self,
@@ -49,7 +48,6 @@ class ClickUpHTTPError(RuntimeError):
             parts.append(f"resp={trimmed}")
         return base + (" [" + " | ".join(parts) + "]" if parts else "")
 
-
 def _req(method: str, url: str, json: Optional[dict] = None, params: Optional[dict] = None) -> dict:
     r = requests.request(method, url, headers=_get_headers(), json=json, params=params, timeout=30)
     if r.status_code // 100 != 2:
@@ -62,6 +60,14 @@ def _req(method: str, url: str, json: Optional[dict] = None, params: Optional[di
     except Exception:
         return {}
 
+def _params_task() -> dict:
+    """
+    If your workspace uses short/custom task ids (like '86c5c...'),
+    ClickUp requires these query params for ALL /task/{id} calls.
+    Safe to include even when using numeric ids.
+    """
+    team_id = os.environ.get("CLICKUP_TEAM_ID")
+    return {"custom_task_ids": "true", "team_id": team_id} if team_id else {}
 
 # ---------- Env helpers ----------
 
@@ -72,12 +78,10 @@ def _get_list_id() -> str:
     return v
 
 def _get_team_id() -> str:
-    # kept for completeness; not used for tags anymore
     v = os.environ.get("CLICKUP_TEAM_ID")
     if not v:
         raise RuntimeError("CLICKUP_TEAM_ID is not set in environment")
     return v
-
 
 # ---------- IDs discovery (Space for this List) ----------
 
@@ -103,7 +107,6 @@ def _get_space_id_for_list() -> str:
     _SPACE_ID_CACHE = str(space_id)
     return _SPACE_ID_CACHE
 
-
 # ---------- Public helpers ----------
 
 def list_fields() -> dict:
@@ -116,7 +119,7 @@ def create_task(name: str, description: str, priority_num: int) -> dict:
     """
     Create a task on the configured List.
     priority: 1 urgent, 2 high, 3 normal, 4 low.
-    Returns the task JSON (expects 'id' and 'url').
+    Returns the task JSON (expects 'id' (short/custom ok) and 'url').
     """
     list_id = _get_list_id()
     url = f"{BASE}/list/{list_id}/task"
@@ -125,14 +128,13 @@ def create_task(name: str, description: str, priority_num: int) -> dict:
 
 def get_task(task_id: str) -> dict:
     url = f"{BASE}/task/{task_id}"
-    return _req("GET", url)
+    return _req("GET", url, params=_params_task())
 
 def update_task_description(task_id: str, new_description: str) -> dict:
     url = f"{BASE}/task/{task_id}"
-    return _req("PUT", url, json={"description": new_description})
+    return _req("PUT", url, json={"description": new_description}, params=_params_task())
 
-
-# ---------- Dropdowns: matching + robust write + read-back verification ----------
+# ---------- Dropdowns: matching + robust write + tolerant read-back verification ----------
 
 _FIELD_CACHE: dict[str, dict] = {}
 
@@ -223,7 +225,7 @@ def _match_dropdown_option(field_id: str, value_name: str, similarity_threshold:
     if best_i >= 0 and best_sim >= similarity_threshold and ids[best_i]:
         return ids[best_i], names[best_i], False
 
-    # 4) give up — explicit failure (no auto-create)
+    # 4) explicit failure
     return "", wanted_raw, False
 
 def _set_dropdown_value_payloads(task_id: str, field_id: str, option_id: str, option_label: str) -> dict:
@@ -242,6 +244,7 @@ def _set_dropdown_value_payloads(task_id: str, field_id: str, option_id: str, op
     """
     field_url = f"{BASE}/task/{task_id}/field/{field_id}"
     task_url  = f"{BASE}/task/{task_id}"
+    params = _params_task()
 
     idx = _option_index_for(field_id, option_id)
 
@@ -264,7 +267,7 @@ def _set_dropdown_value_payloads(task_id: str, field_id: str, option_id: str, op
     last_err: Optional[ClickUpHTTPError] = None
     for method, url, payload in attempts:
         try:
-            return _req(method, url, json=payload)
+            return _req(method, url, json=payload, params=params)
         except ClickUpHTTPError as e:
             last_err = e
             continue
@@ -294,13 +297,26 @@ def _read_dropdown_value(task_id: str, field_id: str) -> Optional[Any]:
             return val
     return None
 
-def set_dropdown_value(task_id: str, field_id: str, value_name: str) -> Tuple[dict, bool, str, str]:
+def set_dropdown_value(
+    task_id: str,
+    field_id: str,
+    value_name: str,
+    *,
+    allow_pending: bool = True,
+    max_wait_s: float = 12.0,
+) -> Tuple[dict, bool, str, str]:
     """
     Match predicted value to an existing option, write it using robust strategies,
     and verify by accepting id OR index OR label on read-back.
     Returns: (resp_json, is_exact, chosen_display_name, chosen_option_id)
-    Raises ClickUpHTTPError if we can't match or if persistence fails.
+
+    Soft-consistency handling:
+      - If ClickUp returns 2xx but the value isn't readable yet, we retry up to ~max_wait_s.
+      - If still not visible and allow_pending=True, we RETURN normally (do not raise).
+      - If still not visible and allow_pending=False, we RAISE ClickUpHTTPError.
     """
+    import time as _t
+
     opt_id, chosen_name, exact = _match_dropdown_option(field_id, value_name)
     if not opt_id:
         raise ClickUpHTTPError(
@@ -311,29 +327,47 @@ def set_dropdown_value(task_id: str, field_id: str, value_name: str) -> Tuple[di
     label = _option_label_for(field_id, opt_id) or chosen_name
     resp = _set_dropdown_value_payloads(task_id, field_id, opt_id, label)
 
-    # --- read-back verification (accept id / index / label) ---
-    persisted = _read_dropdown_value(task_id, field_id)
+    # --- read-back verification with backoff up to max_wait_s ---
+    start = _t.time()
 
-    # Accept exact id
-    if persisted is not None and str(persisted) == str(opt_id):
+    def _persisted_ok() -> bool:
+        val = _read_dropdown_value(task_id, field_id)
+        # Accept exact id
+        if val is not None and str(val) == str(opt_id):
+            return True
+        # Accept numeric index
+        if isinstance(val, int):
+            expected_idx = _option_index_for(field_id, opt_id)
+            if expected_idx is not None and int(val) == int(expected_idx):
+                return True
+        # Accept label string
+        if isinstance(val, str):
+            if val.strip().lower() == (label or "").strip().lower():
+                return True
+        # Accept object with id/label/value
+        if isinstance(val, dict):
+            pid = val.get("id")
+            plabel = (val.get("label") or val.get("value") or "").strip()
+            if (pid and str(pid) == str(opt_id)) or (plabel and plabel.lower() == (label or "").lower()):
+                return True
+        return False
+
+    # Backoff: 0.5, 0.8, 1.1, 1.4, 1.7, 2.0, ... up to max_wait_s
+    attempt = 0
+    sleep = 0.5
+    while (_t.time() - start) < max_wait_s:
+        if _persisted_ok():
+            return resp, exact, chosen_name, opt_id
+        _t.sleep(sleep)
+        attempt += 1
+        sleep = min(sleep + 0.3, 2.0)
+
+    # Still not visible after max_wait_s
+    if allow_pending:
+        # Return as success; callers may annotate "(pending/verify)"
         return resp, exact, chosen_name, opt_id
 
-    # Accept numeric index
-    if isinstance(persisted, int):
-        expected_idx = _option_index_for(field_id, opt_id)
-        if expected_idx is not None and int(persisted) == int(expected_idx):
-            return resp, exact, chosen_name, opt_id
-
-    # Accept label
-    if isinstance(persisted, str) and persisted.strip().lower() == (label or "").strip().lower():
-        return resp, exact, chosen_name, opt_id
-
-    if isinstance(persisted, dict):
-        pid = persisted.get("id")
-        plabel = (persisted.get("label") or persisted.get("value") or "").strip()
-        if (pid and str(pid) == str(opt_id)) or (plabel and plabel.lower() == (label or "").lower()):
-            return resp, exact, chosen_name, opt_id
-
+    # Strict mode: raise with diagnostic
     raise ClickUpHTTPError(
         "Dropdown write returned 2xx but value not persisted",
         url=f"{BASE}/task/{task_id}",
@@ -342,10 +376,9 @@ def set_dropdown_value(task_id: str, field_id: str, value_name: str) -> Tuple[di
             "expected_option_id": opt_id,
             "expected_label": label,
             "expected_index": _option_index_for(field_id, opt_id),
-            "read_back_value": persisted,
+            "read_back_value": _read_dropdown_value(task_id, field_id),
         },
     )
-
 
 # ---------- Tags: ensure in Space, attach to task (best-effort) ----------
 
@@ -392,7 +425,7 @@ def add_tags(task_id: str, tags: List[str]) -> List[str]:
         # Try path form: POST /task/{task_id}/tag/{tag}
         try:
             url1 = f"{BASE}/task/{task_id}/tag/{tag}"
-            _req("POST", url1)
+            _req("POST", url1, params=_params_task())
             continue  # success
         except ClickUpHTTPError as e1:
             if e1.status not in (404, 405):
@@ -402,7 +435,7 @@ def add_tags(task_id: str, tags: List[str]) -> List[str]:
         # Body form: POST /task/{task_id}/tag  {"tags": ["..."]}
         try:
             url2 = f"{BASE}/task/{task_id}/tag"
-            _req("POST", url2, json={"tags": [tag]})
+            _req("POST", url2, json={"tags": [tag]}, params=_params_task())
         except ClickUpHTTPError as e2:
             if e2.status not in (400, 404, 405, 409, 422):
                 failed.append(tag)
@@ -410,7 +443,6 @@ def add_tags(task_id: str, tags: List[str]) -> List[str]:
                 failed.append(tag)
 
     return failed
-
 
 # ---------- Description helpers (visibility fallbacks) ----------
 
@@ -427,7 +459,7 @@ def append_tags_note(task_id: str, tags: List[str]) -> None:
 
 def append_field_note(task_id: str, field_label: str, predicted_value: str, chosen_value: str) -> None:
     """
-    Append a one-liner to the task description explaining the dropdown match.
+    Append a one-liner to the task description explaining the dropdown match or pending state.
     """
     predicted_value = (predicted_value or "").strip()
     if not predicted_value:
