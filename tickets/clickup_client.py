@@ -7,6 +7,8 @@ import json
 import typing as t
 import requests
 
+from .config import TYPE_FIELD_ID, DEPT_FIELD_ID # Import the IDs from config
+
 # ===========================
 # Configuration / constants
 # ===========================
@@ -185,7 +187,11 @@ def get_field_options_for_list(list_id: str, field_id: str) -> list[dict]:
     if cache_key in _FIELD_OPTIONS_CACHE:
         return _FIELD_OPTIONS_CACHE[cache_key]
 
-    fields = _req("GET", f"/list/{list_id}/field", "get_list_fields")
+    # The API returns a dictionary like {"fields": [...]}, so we get it.
+    response_data = _req("GET", f"/list/{list_id}/field", "get_list_fields")
+    # THE FIX IS HERE: We extract the list from the "fields" key.
+    fields = response_data.get("fields", [])
+    
     options: list[dict] = []
     for f in fields or []:
         if str(f.get("id")) == str(field_id):
@@ -254,3 +260,41 @@ def set_dropdown_value(task_id: str, field_id: str, requested_label: str) -> tup
 
     # If ClickUp accepted the request, treat as ok=True even if it was a no-op (already same value)
     return True, exact, chosen, meta
+
+def verify_custom_fields():
+    """
+    Checks if the configured Custom Field IDs exist on the configured List.
+    Raises SystemExit on failure.
+    """
+    print("--- Verifying ClickUp Configuration ---")
+    if not CLICKUP_TOKEN or not CLICKUP_LIST_ID:
+        print("❌ CONFIGURATION ERROR: CLICKUP_TOKEN and CLICKUP_LIST_ID must be set.")
+        raise SystemExit(1)
+
+    try:
+        response_data = _req("GET", f"/list/{CLICKUP_LIST_ID}/field", "verify_fields")
+        fields_on_list = response_data.get("fields", [])
+        field_ids_on_list = {field.get("id") for field in fields_on_list}
+
+        type_id_ok = TYPE_FIELD_ID in field_ids_on_list
+        dept_id_ok = DEPT_FIELD_ID in field_ids_on_list
+
+        if type_id_ok:
+            print(f"✅ 'Type' field ID ({TYPE_FIELD_ID}) found on list.")
+        else:
+            print(f"❌ CONFIGURATION ERROR: 'Type' field ID ({TYPE_FIELD_ID}) was NOT found on List {CLICKUP_LIST_ID}.")
+        
+        if dept_id_ok:
+            print(f"✅ 'Department' field ID ({DEPT_FIELD_ID}) found on list.")
+        else:
+            print(f"❌ CONFIGURATION ERROR: 'Department' field ID ({DEPT_FIELD_ID}) was NOT found on List {CLICKUP_LIST_ID}.")
+
+        if not type_id_ok or not dept_id_ok:
+            print("\nPlease run find_field_ids.py again and update tickets/config.py with the correct IDs.")
+            raise SystemExit(1)
+        
+        print("✅ ClickUp configuration is correct.")
+
+    except Exception as e:
+        print(f"❌ An API error occurred during verification: {e}")
+        raise SystemExit(1)

@@ -2,10 +2,16 @@
 import json
 import streamlit as st
 from agent_runner import run_agent
+from tickets.registry import ensure_loaded
 
 st.set_page_config(page_title="Agentic Ticket Intake", page_icon="🎫", layout="centered")
+
+# Pre-load models on startup for faster processing
+with st.spinner("Loading AI models..."):
+    ensure_loaded()
+
 st.title("🎫 Agentic Ticket Intake")
-st.caption("Clean → Predict → ClickUp (custom ReAct via local Ollama)")
+st.caption("Clean → Predict → ClickUp (ReAct via local Ollama)")
 
 with st.form("ticket_form", clear_on_submit=False):
     subj = st.text_input("Subject", value="SSO login fails intermittently")
@@ -22,3 +28,5 @@ if submitted:
     if res.get("ok") and res.get("task_url"):
         st.success("Task created!")
         st.markdown(f"[Open task in ClickUp]({res['task_url']})")
+    elif not res.get("ok"):
+        st.error(f"Failed to create task: {res.get('reason')}")

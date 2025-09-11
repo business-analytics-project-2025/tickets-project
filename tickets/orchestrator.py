@@ -4,7 +4,8 @@ import asyncio
 from typing import Dict
 
 from .contracts import FinalPrediction, CombinedPredictionError
-from .agents import (
+# This import has been updated from .agents to .ml_models
+from .ml_models import (
     IntakeAgent,
     PreprocessAgent,
     TagsAgent,
@@ -94,7 +95,7 @@ class Orchestrator:
 def predict_all(subject: str, body: str) -> Dict:
     """
     Synchronous convenience wrapper that runs the orchestrator and
-    returns a plain dict for callers (MCP service, tests, etc.).
+    returns a plain dict for callers (API service, tests, etc.).
     """
     async def _run():
         orch = Orchestrator()

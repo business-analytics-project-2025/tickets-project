@@ -55,18 +55,35 @@ def _load_thresholds(path: Path) -> np.ndarray:
     return arr
 
 
+# tickets/registry.py
+# ... (imports and other functions are unchanged) ...
+
+# tickets/registry.py
+
 def _load_model(task: str, num_labels: int, multilabel: bool, weights_path: Path):
     """Instantiate the correct backbone per task and load fine-tuned head weights."""
     base = FILES[task]["base_model"]
+    # 1. Create the correct model CONFIGURATION with the right number of labels.
     cfg = AutoConfig.from_pretrained(
         base,
         num_labels=num_labels,
         problem_type="multi_label_classification" if multilabel else "single_label_classification",
     )
-    model = AutoModelForSequenceClassification.from_pretrained(base, config=cfg)
+    
+    # 2. Create the model's empty ARCHITECTURE from the configuration.
+    #    This creates the model scaffold with randomly initialized weights.
+    model = AutoModelForSequenceClassification.from_config(cfg)
+
+    # 3. Load the state dict from your .pt file, which contains the
+    #    weights for the ENTIRE fine-tuned model.
     state = torch.load(weights_path, map_location="cpu")
-    # strict=True because we normalized all checkpoints to the right backbone
+
+    # 4. Load your fine-tuned weights into the empty scaffold.
+    #    This now works because the architecture and the state dict match perfectly.
     model.load_state_dict(state, strict=True)
+    
+    print(f"✅ Successfully loaded full model weights for task '{task}'.")
+
     model.to(DEVICE)
     model.eval()
     return model

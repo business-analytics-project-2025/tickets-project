@@ -1,19 +1,19 @@
-pandas
-torch
-numpy
+# requirements.txt
+# Core ML
 transformers
-matplotlib
-sentence-transformers
-hf_xet
+numpy
 sentencepiece
-tiktoken
-protobuf
+
+# Agent Framework
+langchain
+langchain-community
+langchain-ollama  # <-- NEW
+pydantic
+
+# Web & UI
 fastapi
 uvicorn
-requests
 streamlit
-langchain==0.2.14
-langchain-community==0.2.11
-streamlit>=1.34.0
-requests>=2.31.0
-pydantic>=2.5,<3
+
+# Utilities
+requests
