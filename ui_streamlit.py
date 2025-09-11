@@ -4,12 +4,12 @@ import streamlit as st
 from agent_runner import run_agent
 
 st.set_page_config(page_title="Agentic Ticket Intake", page_icon="🎫", layout="centered")
-
 st.title("🎫 Agentic Ticket Intake")
+st.caption("Clean → Predict → ClickUp (custom ReAct via local Ollama)")
 
 with st.form("ticket_form", clear_on_submit=False):
-    subj = st.text_input("Subject", value="")
-    body = st.text_area("Body", height=200, value="")
+    subj = st.text_input("Subject", value="SSO login fails intermittently")
+    body = st.text_area("Body", height=200, value="Users redirected back to login after update.\n\nThanks,\nBob")
     submitted = st.form_submit_button("Submit")
 
 if submitted:

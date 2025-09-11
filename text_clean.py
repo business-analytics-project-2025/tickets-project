@@ -43,7 +43,6 @@ def _fix_typos(text: str) -> str:
         w = m.group(0)
         lower = w.lower()
         repl = _COMMON_TYPO_MAP.get(lower, w)
-        # preserve capitalization if needed (very simple rule)
         return repl.capitalize() if w[0].isupper() else repl
     return _WORD_RE.sub(_sub, text)
 
@@ -52,10 +51,8 @@ def clean_subject_body(subject: str, body: str) -> Tuple[str, str]:
     b = (body or "").strip()
     if b:
         b = _strip_signature(b)
-    # light, obvious typos only — no paraphrase
     s = _fix_typos(s)
     b = _fix_typos(b)
-    # collapse excessive whitespace
     s = re.sub(r"\s+", " ", s).strip()
     b = re.sub(r"[ \t]+\n", "\n", b)
     b = re.sub(r"\n{3,}", "\n\n", b).strip()

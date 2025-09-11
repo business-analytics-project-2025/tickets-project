@@ -1,41 +1,65 @@
 # agent_runner.py
 from __future__ import annotations
-import json, re
-from typing import Dict, Any, List, Tuple
 
-# LangChain (ReAct with ChatOllama / local Ollama)
+import json
+import re
+from typing import Any, Dict, Tuple
+
+# --- LLM (local via Ollama) ---
 from langchain_community.chat_models import ChatOllama
-from langchain.agents import Tool, create_react_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate
 
-# Our helper + your existing modules
+# --- Light cleaner tool ---
 from text_clean import clean_subject_body
 
-# Pipeline (use your async Orchestrator wrapper)
-from tickets.orchestrator import predict_all as pipeline_predict_all
+# --- Pipeline + ClickUp imports (support both flat and 'tickets.' package layouts) ---
+try:
+    # If your files live under a 'tickets/' package
+    from tickets.orchestrator import predict_all as pipeline_predict_all
+    from tickets.clickup_client import (
+        create_task,
+        add_tags,
+        set_dropdown_value,
+        append_tags_note,
+        append_field_note,
+        ClickUpHTTPError,
+    )
+    from tickets.config import PRIORITY_TO_CLICKUP
+    from tickets.service_submit import TYPE_FIELD_ID, DEPT_FIELD_ID
+except Exception:
+    # If your files are flat at repo root
+    from tickets.orchestrator import predict_all as pipeline_predict_all
+    from tickets.clickup_client import (
+        create_task,
+        add_tags,
+        set_dropdown_value,
+        append_tags_note,
+        append_field_note,
+        ClickUpHTTPError,
+    )
+    from tickets.config import PRIORITY_TO_CLICKUP
+    from tickets.service_submit import TYPE_FIELD_ID, DEPT_FIELD_ID
 
-# ClickUp helpers + IDs & mapping reused from your code
-from tickets.clickup_client import (
-    create_task, add_tags, set_dropdown_value,
-    append_tags_note, append_field_note, ClickUpHTTPError
-)
-from tickets.config import PRIORITY_TO_CLICKUP
-from tickets.service_submit import TYPE_FIELD_ID, DEPT_FIELD_ID, submit_ticket as service_submit
 
-from tickets.duplicate_check import dedupe as dc_dedupe, remember as dc_remember, make_hash as dc_make_hash
-
-from tickets.clickup_client import get_task
-
-# -------------------- Tool functions (string in / out as JSON) --------------------
-
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
 def _as_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
+
+def _obs_json(s: str) -> Dict[str, Any]:
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", s or "")
+        return json.loads(m.group(0)) if m else {"ok": False, "reason": "non_json_observation"}
+
+
+# ----------------------------------------------------------------------
+# Tools
+# ----------------------------------------------------------------------
 def tool_clean_text(inp: str) -> str:
-    """
-    Expects: {"subject": "...", "body": "..."}
-    Returns: {"ok": true, "subject": "...", "body": "..."} OR {"ok": false, "reason": "..."}
-    """
+    """Input: {"subject": str, "body": str} -> {"ok": true, "subject": str, "body": str}"""
     try:
         data = json.loads(inp or "{}")
         s, b = clean_subject_body(data.get("subject", ""), data.get("body", ""))
@@ -43,27 +67,28 @@ def tool_clean_text(inp: str) -> str:
     except Exception as e:
         return _as_json({"ok": False, "reason": f"clean_failed: {e}"})
 
+
 def tool_predict_pipeline(inp: str) -> str:
-    # Expects: {"subject":"...","body":"..."}
-    import json
+    """
+    Input: {"subject": str, "body": str}
+    Return: {"ok": true, "pred": {priority, type, department, tags}} or {"ok": false, "reason": "..."}
+    """
     try:
         data = json.loads(inp or "{}")
-        subject = data.get("subject", "")
-        body = data.get("body", "")
+        subject = (data.get("subject") or "").strip()
+        body = (data.get("body") or "").strip()
+        if not subject and not body:
+            return _as_json({"ok": False, "reason": "prediction_failed: Empty ticket after preprocessing"})
         pred = pipeline_predict_all(subject, body)
-        return json.dumps({"ok": True, "pred": pred}, ensure_ascii=False)
+        return _as_json({"ok": True, "pred": pred})
     except Exception as e:
-        return json.dumps({"ok": False, "reason": f"prediction_failed: {e}"}, ensure_ascii=False)
+        return _as_json({"ok": False, "reason": f"prediction_failed: {e}"})
+
 
 def tool_create_clickup_task(inp: str) -> str:
     """
-    Expects:
-      {"subject":"...", "body":"...", "pred":{
-          "priority": str, "type": str, "department": str, "tags": [str, ...]
-      }}
-    Returns:
-      {"ok": true, "task_id": "<id>", "task_url": "<url>"}  (success)
-      {"ok": false, "reason": "<why>"}                      (stop-on-error)
+    Input:  {"subject": str, "body": str, "pred": {...}}
+    Output: {"ok": true, "task_id": "...", "task_url": "..."} OR {"ok": false, "reason": "..."}
     """
     import json
     try:
@@ -72,49 +97,69 @@ def tool_create_clickup_task(inp: str) -> str:
         body    = (data.get("body") or "").strip()
         pred    = data.get("pred") or {}
 
-        # Priority mapping (default Normal=3)
+        # Priority mapping (1=urgent, 2=high, 3=normal, 4=low)
         priority_str = (pred.get("priority") or "").strip()
         priority_num = PRIORITY_TO_CLICKUP.get(priority_str, 3)
 
-        # --- Create task (short id is fine with your client) ---
-        task = create_task(name=subject, description=body, priority_num=priority_num)
-        task_id  = str(task.get("id") or "").strip()
-        task_url = str(task.get("url") or "").strip()
-        if not task_id:
-            return _as_json({"ok": False, "reason": "clickup_failed: create_task returned no id"})
+        # --- Create the task (tolerant to multiple return shapes) ---
+        task_raw = create_task(name=subject, description=body, priority_num=priority_num)
 
-        # --- TYPE dropdown ---
+        # Normalize task payload -> task_obj dict with at least {"id": "...", "url": "...?"}
+        if isinstance(task_raw, dict):
+            task_obj = task_raw.get("task") if "task" in task_raw else task_raw
+        elif isinstance(task_raw, str):
+            # Could be a plain id or a JSON string
+            try:
+                maybe = json.loads(task_raw)
+                task_obj = maybe.get("task") if isinstance(maybe, dict) and "task" in maybe else maybe
+            except Exception:
+                task_obj = {"id": task_raw}
+        else:
+            task_obj = {"raw": str(task_raw)}
+
+        task_id = str(task_obj.get("id")) if isinstance(task_obj, dict) else None
+        if not task_id:
+            return _as_json({
+                "ok": False,
+                "reason": f"clickup_failed: create_task_return_shape: {type(task_raw).__name__}"
+            })
+
+        # Synthesize task_url if not provided by API
+        task_url = ""
+        if isinstance(task_obj, dict):
+            task_url = str(task_obj.get("url") or "")
+        if not task_url:
+            task_url = f"https://app.clickup.com/t/{task_id}"
+
+        # --- TYPE dropdown (tolerant: no-op is success; note if fuzzy) ---
         tval = (pred.get("type") or "").strip()
         if tval:
             try:
-                _soft_set_dropdown(task_id, TYPE_FIELD_ID, "Type", tval)
+                _, exact, chosen, _ = set_dropdown_value(task_id, TYPE_FIELD_ID, tval)
+                if not exact:
+                    append_field_note(task_id, "Type", tval, chosen)
             except ClickUpHTTPError as e:
                 return _as_json({"ok": False, "reason": f"clickup_failed: type_set: {e}"})
 
-        # --- DEPARTMENT dropdown ---
+        # --- DEPARTMENT dropdown (tolerant: no-op is success; note if fuzzy) ---
         dval = (pred.get("department") or "").strip()
         if dval:
             try:
-                _soft_set_dropdown(task_id, DEPT_FIELD_ID, "Department", dval)
+                _, exact, chosen, _ = set_dropdown_value(task_id, DEPT_FIELD_ID, dval)
+                if not exact:
+                    append_field_note(task_id, "Department", dval, chosen)
             except ClickUpHTTPError as e:
                 return _as_json({"ok": False, "reason": f"clickup_failed: department_set: {e}"})
 
-
-        # --- TAGS (best effort; falls back to note on failure) ---
+        # --- TAGS (best effort; append note if any failures) ---
         tags = pred.get("tags") or []
         try:
             failed = add_tags(task_id, tags)
             if failed:
                 append_tags_note(task_id, failed)
         except Exception:
+            # If tag attach fails wholesale, still leave a note with requested tags
             append_tags_note(task_id, tags or [])
-
-        # --- Remember duplicate hash AFTER success ---
-        try:
-            h = dc_make_hash(subject, body)
-            dc_remember(h)
-        except Exception:
-            pass
 
         return _as_json({"ok": True, "task_id": task_id, "task_url": task_url})
 
@@ -123,120 +168,37 @@ def tool_create_clickup_task(inp: str) -> str:
 
 
 
-def tool_check_duplicate(inp: str) -> str:
-    """
-    Input JSON: {"subject": "...", "body": "..."}  (use CLEANED text)
-    Returns:
-      - Duplicate: {"ok": false, "reason": "duplicate_found", "dup_hash": "<sha256>"}
-        (Agent will STOP due to ok:false per the hard rule.)
-      - No duplicate: {"ok": true, "duplicate": false, "dup_hash": "<sha256>"}
-      - Error: {"ok": false, "reason": "duplicate_check_failed: ..."}
-    """
-    import json
-    try:
-        data = json.loads(inp or "{}")
-        subject = (data.get("subject") or "").strip()
-        body    = (data.get("body") or "").strip()
-        is_dup, h = dc_dedupe(subject, body)  # your function: returns (bool, hash)
-        if is_dup:
-            return json.dumps({"ok": False, "reason": "duplicate_found", "dup_hash": h}, ensure_ascii=False)
-        return json.dumps({"ok": True, "duplicate": False, "dup_hash": h}, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"ok": False, "reason": f"duplicate_check_failed: {e}"}, ensure_ascii=False)
-    
-# --- helper: tolerant dropdown setter (treats read-back lag as success) ---
-def _soft_set_dropdown(task_id: str, field_id: str, field_label_for_note: str, desired_value: str) -> None:
-    """
-    Calls tickets.clickup_client.set_dropdown_value(). If ClickUp returns 2xx but
-    read-back is still None (eventual consistency), we add a small '(pending)'
-    note and treat it as success so the agent doesn't fail the run.
-    """
-    from tickets.clickup_client import set_dropdown_value, append_field_note, ClickUpHTTPError
-
-    try:
-        _resp, exact, chosen, _optid = set_dropdown_value(task_id, field_id, desired_value)
-        if not exact and chosen:
-            append_field_note(task_id, f"{field_label_for_note} (fuzzy)", desired_value, chosen)
-    except ClickUpHTTPError as e:
-        msg = str(e)
-        # the specific soft case from your client
-        if "Dropdown write returned 2xx but value not persisted" in msg:
-            append_field_note(task_id, f"{field_label_for_note} (pending/verify)", desired_value, "(pending)")
-            return  # treat as success
-        # anything else is a real failure -> bubble up
-        raise
-
-def _cf_value(task_json: dict, field_id: str):
-    for cf in (task_json or {}).get("custom_fields", []) or []:
-        if str(cf.get("id")) == str(field_id):
-            return cf.get("value")
-    return None
-
-def _blocking_wait_dropdown(task_id: str, field_id: str, expect_label: str, expect_opt_id: str | None) -> bool:
-    """
-    Wait up to ~12s for a dropdown to be visible on the task.
-    Accepts equality by option id OR by label (string or object).
-    Returns True if visible, False if not.
-    """
-    import time
-    deadline = time.time() + 12.0
-    while time.time() < deadline:
-        try:
-            t = get_task(task_id)
-        except ClickUpHTTPError:
-            time.sleep(0.7)
-            continue
-        val = _cf_value(t, field_id)
-        # accept option id exact
-        if expect_opt_id and val is not None and str(val) == str(expect_opt_id):
-            return True
-        # accept label as string
-        if isinstance(val, str) and val.strip().lower() == (expect_label or "").strip().lower():
-            return True
-        # accept object with id/label/value
-        if isinstance(val, dict):
-            pid = val.get("id")
-            plabel = (val.get("label") or val.get("value") or "").strip()
-            if (expect_opt_id and str(pid) == str(expect_opt_id)) or (plabel and plabel.lower() == (expect_label or "").lower()):
-                return True
-        time.sleep(1.2)
-    return False
-# -------------------- Agent setup --------------------
-
-ALLOWED_TOOLS = ["clean_text", "check_duplicate", "predict_pipeline", "create_clickup_task"]
+# ----------------------------------------------------------------------
+# Minimal custom ReAct loop (agentic, robust)
+# ----------------------------------------------------------------------
+ALLOWED_TOOLS = ["clean_text", "predict_pipeline", "create_clickup_task"]
 
 SYSTEM_PROMPT = (
     "You are a disciplined ReAct agent that MUST use tools.\n"
     "Protocol (exactly):\n"
     "Thought: describe next step\n"
-    "Action: one of [clean_text, check_duplicate, predict_pipeline, create_clickup_task]\n"
+    "Action: one of [clean_text, predict_pipeline, create_clickup_task]\n"
     "Action Input: a single JSON object (no code fences)\n"
     "Observation: the tool's JSON result\n"
     "…repeat until done… then:\n"
     "Final Answer: a single JSON object only.\n\n"
     "Hard rules:\n"
     "1) Always call clean_text FIRST.\n"
-    "2) Then call check_duplicate. If it returns {\"ok\": false, \"reason\": \"duplicate_found\", ...}, STOP and output that JSON as the Final Answer.\n"
-    "3) If no duplicate, call predict_pipeline, then create_clickup_task, and STOP.\n"
+    "2) If any Observation contains {\"ok\": false, ...}, STOP and output that JSON as the Final Answer.\n"
+    "3) After clean_text, call predict_pipeline, then create_clickup_task, and STOP.\n"
     "4) The Final Answer must be ONLY one JSON object (no extra text, no code fences).\n"
-    "5) Never invent tool names; use only [clean_text, check_duplicate, predict_pipeline, create_clickup_task].\n"
+    "5) Never invent tool names; use only [clean_text, predict_pipeline, create_clickup_task].\n"
     "6) Always provide valid JSON in Action Input (no comments, no trailing commas).\n\n"
-    "Mini example (duplicate → stop):\n"
-    "Thought: I will clean the text.\n"
-    "Action: clean_text\n"
-    "Action Input: {\"subject\":\"s\",\"body\":\"b\"}\n"
-    "Observation: {\"ok\": true, \"subject\": \"s2\", \"body\": \"b2\"}\n"
-    "Thought: I will check for duplicates.\n"
-    "Action: check_duplicate\n"
-    "Action Input: {\"subject\":\"s2\",\"body\":\"b2\"}\n"
-    "Observation: {\"ok\": false, \"reason\": \"duplicate_found\", \"dup_hash\": \"...\"}\n"
-    "Final Answer: {\"ok\": false, \"reason\": \"duplicate_found\", \"dup_hash\": \"...\"}\n\n"
+    "Respond in this EXACT template each step (no extra lines):\n"
+    "Thought: <your short thought>\n"
+    "Action: <tool name>\n"
+    "Action Input: {\"key\": \"value\"}\n\n"
     "Mini example (success):\n"
     "Thought: I will clean the text.\n"
     "Action: clean_text\n"
     "Action Input: {\"subject\":\"s\",\"body\":\"b\"}\n"
     "Observation: {\"ok\": true, \"subject\": \"s2\", \"body\": \"b2\"}\n"
-    "Thought: No duplicate; I will run the ML pipeline.\n"
+    "Thought: I will run the ML pipeline to get predictions.\n"
     "Action: predict_pipeline\n"
     "Action Input: {\"subject\":\"s2\",\"body\":\"b2\"}\n"
     "Observation: {\"ok\": true, \"pred\": {\"priority\": \"Normal\", \"type\": \"Tech Support\", \"department\": \"IT\", \"tags\": [\"Network\"]}}\n"
@@ -247,26 +209,23 @@ SYSTEM_PROMPT = (
     "Final Answer: {\"ok\": true, \"task_id\": \"123\", \"task_url\": \"https://...\"}\n"
 )
 
+
 def _render_prompt(input_json: str, scratchpad: str) -> str:
-    return (
-        SYSTEM_PROMPT
-        + "\n"
-        + "Input ticket JSON:\n"
-        + input_json
-        + "\n\n"
-        + (scratchpad or "")
-    )
+    return SYSTEM_PROMPT + "\n" + "Input ticket JSON:\n" + input_json + "\n\n" + (scratchpad or "")
+
 
 _ACTION_RE = re.compile(
     r"Thought:\s*(?P<thought>.+?)\s*"
     r"Action:\s*(?P<tool>\w+)\s*"
     r"Action Input:\s*(?P<input>\{[\s\S]*\})",
-    re.IGNORECASE | re.DOTALL
+    re.IGNORECASE | re.DOTALL,
 )
+
 
 def _strip_code_fences(text: str) -> str:
     # Remove ```json ... ``` or ``` ... ``` fences if the model adds them
     return re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", text, flags=re.IGNORECASE)
+
 
 def _parse_action(text: str) -> Tuple[str, Dict[str, Any], str]:
     """Extract (tool, payload_dict, thought) from model text. Raises on failure."""
@@ -285,13 +244,6 @@ def _parse_action(text: str) -> Tuple[str, Dict[str, Any], str]:
     thought = m.group("thought").strip()
     return tool, payload, thought
 
-def _obs_json(s: str) -> Dict[str, Any]:
-    try:
-        return json.loads(s)
-    except Exception:
-        # last resort: pull first {...}
-        m = re.search(r"\{[\s\S]*\}", s or "")
-        return json.loads(m.group(0)) if m else {"ok": False, "reason": "non_json_observation"}
 
 def _call_tool(tool: str, payload: Dict[str, Any]) -> str:
     if tool == "clean_text":
@@ -302,16 +254,23 @@ def _call_tool(tool: str, payload: Dict[str, Any]) -> str:
         return tool_create_clickup_task(json.dumps(payload, ensure_ascii=False))
     return json.dumps({"ok": False, "reason": f"invalid_tool: {tool}"}, ensure_ascii=False)
 
+
+# ----------------------------------------------------------------------
+# Public API
+# ----------------------------------------------------------------------
 def run_agent(subject: str, body: str) -> Dict[str, Any]:
+    """
+    Returns one dict:
+      {"ok": true, "task_id": "...", "task_url": "..."} OR {"ok": false, "reason": "..."}.
+    """
     llm = ChatOllama(model="llama3", temperature=0.0, num_ctx=4096, num_predict=512)
     input_json = json.dumps({"subject": subject, "body": body}, ensure_ascii=False)
 
-    scratch = ""  # ReAct transcript accumulated here
+    scratch = ""
     last_clean = None
     last_pred = None
 
-    # Deterministic 4-step loop
-    for step in range(1, 5):
+    for step in range(1, 4):
         # Ask the LLM for the next Thought/Action
         resp = llm.invoke(_render_prompt(input_json, scratch))
         text = getattr(resp, "content", "") if resp else ""
@@ -319,61 +278,49 @@ def run_agent(subject: str, body: str) -> Dict[str, Any]:
         # Try to parse the next Action
         try:
             tool, payload, thought = _parse_action(text)
-        except Exception as e:
-            # One focused retry with explicit template
+        except Exception:
+            # one focused retry with explicit template
             nudge = (
                 f"{scratch}"
                 "Your previous message did not include a valid Action / Action Input JSON.\n"
                 "Respond in EXACTLY this format (no code fences):\n"
                 "Thought: <your short thought>\n"
                 f"Action: <one of {ALLOWED_TOOLS}>\n"
-                "Action Input: {\"key\":\"value\",...}\n"
+                "Action Input: {\"key\":\"value\"}\n"
             )
             resp2 = llm.invoke(_render_prompt(input_json, nudge))
             text2 = getattr(resp2, "content", "") if resp2 else ""
             try:
                 tool, payload, thought = _parse_action(text2)
             except Exception:
-                # Enforce step tool if parsing still fails
-                if step == 1 and tool != "clean_text":
+                # Enforce correct tool for this step with best-known payload
+                if step == 1:
                     tool = "clean_text"
                     payload = json.loads(input_json)
-
-                elif step == 2 and tool != "check_duplicate":
-                    tool = "check_duplicate"
-                    subj = (last_clean or {}).get("subject") or json.loads(input_json)["subject"]
-                    bod  = (last_clean or {}).get("body") or json.loads(input_json)["body"]
-                    payload = {"subject": subj, "body": bod}
-
-                elif step == 3 and tool != "predict_pipeline":
+                    thought = "I will clean the text."
+                elif step == 2:
                     tool = "predict_pipeline"
-                    subj = (last_clean or {}).get("subject") or json.loads(input_json)["subject"]
-                    bod  = (last_clean or {}).get("body") or json.loads(input_json)["body"]
+                    base = json.loads(input_json)
+                    subj_clean = (last_clean or {}).get("subject")
+                    body_clean = (last_clean or {}).get("body")
+                    subj = (subj_clean if (subj_clean or "").strip() else base["subject"]) or ""
+                    bod = (body_clean if (body_clean or "").strip() else base["body"]) or ""
+                    subj = subj.strip() or base["subject"].strip()
+                    bod = bod.strip() or base["body"].strip()
                     payload = {"subject": subj, "body": bod}
-
-                elif step == 4 and tool != "create_clickup_task":
+                    thought = "I will run the ML pipeline to get predictions."
+                else:
                     tool = "create_clickup_task"
-                    subj = (last_clean or {}).get("subject") or json.loads(input_json)["subject"]
-                    bod  = (last_clean or {}).get("body") or json.loads(input_json)["body"]
+                    base = json.loads(input_json)
+                    subj_clean = (last_clean or {}).get("subject")
+                    body_clean = (last_clean or {}).get("body")
+                    subj = (subj_clean if (subj_clean or "").strip() else base["subject"]) or ""
+                    bod = (body_clean if (body_clean or "").strip() else base["body"]) or ""
+                    subj = subj.strip() or base["subject"].strip()
+                    bod = bod.strip() or base["body"].strip()
                     pred = last_pred or {}
                     payload = {"subject": subj, "body": bod, "pred": pred}
-
-        # Enforce order: clean_text → predict_pipeline → create_clickup_task
-        if step == 1 and tool != "clean_text":
-            tool = "clean_text"
-            payload = json.loads(input_json)
-        if step == 2 and tool != "predict_pipeline":
-            tool = "predict_pipeline"
-            # prefer cleaned values if we have them
-            subj = (last_clean or {}).get("subject") or json.loads(input_json)["subject"]
-            bod  = (last_clean or {}).get("body") or json.loads(input_json)["body"]
-            payload = {"subject": subj, "body": bod}
-        if step == 3 and tool != "create_clickup_task":
-            tool = "create_clickup_task"
-            subj = (last_clean or {}).get("subject") or json.loads(input_json)["subject"]
-            bod  = (last_clean or {}).get("body") or json.loads(input_json)["body"]
-            pred = last_pred or {}
-            payload = {"subject": subj, "body": bod, "pred": pred}
+                    thought = "I will create the ClickUp task and set fields."
 
         # Call the chosen tool
         obs_str = _call_tool(tool, payload)
@@ -381,13 +328,13 @@ def run_agent(subject: str, body: str) -> Dict[str, Any]:
 
         # Append to scratchpad
         scratch += (
-            f"Thought: {('I will ' + ('clean the text' if tool=='clean_text' else 'run the ML pipeline' if tool=='predict_pipeline' else 'create the ClickUp task'))}.\n"
+            f"Thought: {thought}\n"
             f"Action: {tool}\n"
             f"Action Input: {json.dumps(payload, ensure_ascii=False)}\n"
             f"Observation: {obs_str}\n"
         )
 
-        # Stop-on-error
+        # Stop-on-error: return the tool's JSON as-is
         if isinstance(obs, dict) and obs.get("ok") is False:
             return obs
 
@@ -397,18 +344,18 @@ def run_agent(subject: str, body: str) -> Dict[str, Any]:
         if tool == "predict_pipeline" and obs.get("ok"):
             last_pred = obs.get("pred") if isinstance(obs.get("pred"), dict) else None
 
-        # If task created, finish
-        if tool == "create_clickup_task" and obs.get("ok"):
-            return {"ok": True, "task_id": obs.get("task_id"), "task_url": obs.get("task_url")}
+        # Success on final step:
+        if tool == "create_clickup_task":
+            # Primary: explicit ok==True
+            if isinstance(obs, dict) and obs.get("ok") is True:
+                return {"ok": True, "task_id": obs.get("task_id"), "task_url": obs.get("task_url")}
+            # Secondary: tolerate missing "ok" if task_id/url present
+            if isinstance(obs, dict) and (obs.get("task_id") or obs.get("task_url")):
+                return {"ok": True, "task_id": obs.get("task_id"), "task_url": obs.get("task_url")}
 
-    # If we exit loop without success, try to salvage a JSON the model might have printed
-    # (stays agentic: we only parse model/observation text; no direct tool calls)
-    m = re.search(r"\{[\s\S]*\}", scratch.split("Observation:")[-1] if "Observation:" in scratch else "")
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
+    # If we exit without success, surface the last observation's reason if present
+    last_json = _obs_json(scratch.split("Observation:")[-1]) if "Observation:" in scratch else {}
+    if isinstance(last_json, dict) and last_json.get("reason"):
+        return {"ok": False, "reason": last_json.get("reason")}
+
     return {"ok": False, "reason": "agent_incomplete"}
-
-
