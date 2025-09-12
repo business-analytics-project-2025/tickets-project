@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-MODEL_ASSETS_DIR = Path(r"C:\Users\chria\Documents\Μεταπτυχιακό\Deep Learning\tickets-project\models")
+MODEL_ASSETS_DIR = Path.cwd() / "models"
 
 MAX_LENGTH  = 256
 USE_FAST    = False

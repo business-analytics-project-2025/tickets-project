@@ -8,7 +8,6 @@ from tickets.clickup_client import (
     create_task, add_tags, set_dropdown_value,
     append_tags_note, append_field_note
 )
-
 from tickets.config import PRIORITY_TO_CLICKUP, TYPE_FIELD_ID, DEPT_FIELD_ID
 
 @tool
@@ -52,9 +51,8 @@ def create_clickup_task(json_input_str: str) -> str:
         if not task_id:
             return json.dumps({"ok": False, "reason": "ClickUp API did not return a task ID", "response": task})
 
-        # --- 2. ADD THIS 1-SECOND DELAY ---
+        # Add a short delay to prevent API race conditions
         time.sleep(1) 
-        # ------------------------------------
 
         if ticket_type:
             _, exact, chosen, _ = set_dropdown_value(task_id, TYPE_FIELD_ID, ticket_type)

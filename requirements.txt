@@ -11,9 +11,8 @@ langchain-ollama  # <-- NEW
 pydantic
 
 # Web & UI
-fastapi
-uvicorn
 streamlit
 
 # Utilities
 requests
+python-dotenv
