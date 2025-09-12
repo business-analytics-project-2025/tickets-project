@@ -1,5 +1,6 @@
 # requirements.txt
 # Core ML
+torch
 transformers
 numpy
 sentencepiece

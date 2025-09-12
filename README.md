@@ -41,7 +41,6 @@ python -m venv .venv
 
 ### 3. Install Dependencies
 ```bash
-pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
 pip install -r requirements.txt
 ```
 
