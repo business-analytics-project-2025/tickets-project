@@ -32,7 +32,7 @@ FILES = {
         "multilabel": False,
     },
     "priority": {
-        "base_model": "roberta-base",                 # ← RoBERTa
+        "base_model": "distilbert-base-uncased",                 # ← DistilBERT
         "weights": "pretrained_priority_model_weights.pt",
         "labels":  "priority_labels.json",
         "extra":   None,
