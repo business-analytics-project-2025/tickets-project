@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Tuple
 
 CACHE_PATH = Path(".dup_cache.json")
-TTL_SECONDS = 7 * 24 * 3600  # one week
+TTL_SECONDS = 7 * 24 * 3600
 
 def _now() -> int:
     return int(time.time())

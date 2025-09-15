@@ -1,14 +1,19 @@
-pandas
+# requirements.txt
+# Core ML
 torch
-numpy
 transformers
-matplotlib
-sentence-transformers
-hf_xet
+numpy
 sentencepiece
-tiktoken
-protobuf
-fastapi
-uvicorn
-requests
+
+# Agent Framework
+langchain
+langchain-community
+langchain-ollama  # <-- NEW
+pydantic
+
+# Web & UI
 streamlit
+
+# Utilities
+requests
+python-dotenv

@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-MODEL_ASSETS_DIR = Path(r"C:\Users\chria\Documents\Μεταπτυχιακό\Deep Learning\tickets-project\models")
+MODEL_ASSETS_DIR = Path.cwd() / "models"
 
 MAX_LENGTH  = 256
 USE_FAST    = False
@@ -41,3 +41,6 @@ FILES = {
 }
 
 PRIORITY_TO_CLICKUP = {"High": 2, "Medium": 3, "Low": 4}
+
+TYPE_FIELD_ID = "660e1b3b-ec41-40a6-9863-979e44951c70"
+DEPT_FIELD_ID = "90647e3f-2209-4d5c-be47-7780a883ac28"

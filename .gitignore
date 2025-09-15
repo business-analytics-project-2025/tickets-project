@@ -3,3 +3,4 @@
 *.pt
 *.csv
 *.json
+*.env
