@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-MODEL_ASSETS_DIR = Path.cwd() / "models"
+MODEL_ASSETS_DIR = Path.cwd() / "models_weights"
 
 MAX_LENGTH  = 256
 USE_FAST    = False
