@@ -1,4 +1,3 @@
-# tickets/agents.py
 import uuid
 import numpy as np
 import torch
@@ -28,7 +27,6 @@ class PreprocessAgent:
         ensure_loaded()
 
     def handle(self, ticket: Ticket) -> Ticket:
-        # Optionally normalize whitespace, etc.
         ticket.subject = ticket.subject.strip()
         ticket.body = ticket.body.strip()
         return ticket

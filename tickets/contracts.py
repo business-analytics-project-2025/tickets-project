@@ -1,4 +1,3 @@
-# tickets/contracts.py
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -17,10 +16,10 @@ class Tokenized:
 @dataclass
 class AgentOutput:
     ticket_id: str
-    task: str                      # "tags" | "department" | "type" | "priority"
-    preds: List[str]               # multi-label: list; single-label: [label]
-    scores: Dict[str, float]       # label -> probability/logit
-    model_version: str = "v1"      # placeholder; wire real versions later
+    task: str
+    preds: List[str]
+    scores: Dict[str, float]
+    model_version: str = "v1"
 
 @dataclass
 class FinalPrediction:
@@ -31,7 +30,7 @@ class FinalPrediction:
     department: str
     type: str
     priority: str
-    confidences: Dict[str, Dict[str, float]]   # task -> (label -> score)
+    confidences: Dict[str, Dict[str, float]]
 
 class CombinedPredictionError(RuntimeError):
     """Raised when any agent fails; no partials allowed."""

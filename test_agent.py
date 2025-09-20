@@ -1,8 +1,6 @@
-# test_agent.py
 import json
 from agent_runner import run_agent
 
-# Ensure your Ollama server is running with `ollama run llama3`
 print("Running agent...")
 res = run_agent(
     "SSO login fails intermitently",

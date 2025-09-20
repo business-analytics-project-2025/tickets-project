@@ -1,4 +1,3 @@
-# tickets/config.py
 import os
 from pathlib import Path
 
@@ -11,28 +10,28 @@ DEVICE      = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "") or os.environ
 
 FILES = {
     "tags": {
-        "base_model": "microsoft/deberta-v3-large",   # ← DeBERTa v3
+        "base_model": "microsoft/deberta-v3-large",
         "weights": "pretrained_tags_model_weights.pt",
         "labels":  "tags_labels.json",
         "extra":   "tags_thresholds.json",
         "multilabel": True,
     },
     "department": {
-        "base_model": "bert-base-cased",            # ← BERT
+        "base_model": "bert-base-cased",
         "weights": "pretrained_department_model_weights.pt",
         "labels":  "department_labels.json",
         "extra":   None,
         "multilabel": False,
     },
     "type": {
-        "base_model": "distilbert-base-uncased",      # ← DistilBERT
+        "base_model": "distilbert-base-uncased",
         "weights": "pretrained_type_model_weights.pt",
         "labels":  "type_labels.json",
         "extra":   None,
         "multilabel": False,
     },
     "priority": {
-        "base_model": "distilbert-base-uncased",                 # ← DistilBERT
+        "base_model": "distilbert-base-uncased",
         "weights": "pretrained_priority_model_weights.pt",
         "labels":  "priority_labels.json",
         "extra":   None,

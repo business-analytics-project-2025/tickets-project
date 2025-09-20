@@ -1,4 +1,3 @@
-# clickup_client.py
 from __future__ import annotations
 
 import os
@@ -7,31 +6,25 @@ import json
 import typing as t
 import requests
 
-from .config import TYPE_FIELD_ID, DEPT_FIELD_ID # Import the IDs from config
+from .config import TYPE_FIELD_ID, DEPT_FIELD_ID
 
-# ===========================
 # Configuration / constants
-# ===========================
-
 CLICKUP_BASE = os.getenv("CLICKUP_BASE", "https://api.clickup.com/api/v2")
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN", "")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID", "")
 CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID", "")
 
-TIMEOUT = 30  # seconds
+TIMEOUT = 30
 HEADERS = {
     "Authorization": CLICKUP_TOKEN or "",
     "Content-Type": "application/json",
 }
 
 # Simple in-memory cache for field options to reduce API calls
-_FIELD_OPTIONS_CACHE: dict[tuple[str, str], list[dict]] = {}  # (list_id, field_id) -> options list
+_FIELD_OPTIONS_CACHE: dict[tuple[str, str], list[dict]] = {}
 
 
-# ===========================
 # Errors
-# ===========================
-
 class ClickUpHTTPError(RuntimeError):
     """Raised for non-2xx ClickUp responses with context."""
     def __init__(self, status: int, where: str, text: str):
@@ -51,10 +44,7 @@ def _require_env():
         raise ClickUpHTTPError(0, "env_check", f"Missing env vars: {', '.join(missing)}")
 
 
-# ===========================
 # HTTP helpers
-# ===========================
-
 def _req(method: str, path: str, where: str, *, params: dict | None = None, data: dict | None = None) -> dict:
     url = f"{CLICKUP_BASE}{path}"
     try:
@@ -75,14 +65,10 @@ def _req(method: str, path: str, where: str, *, params: dict | None = None, data
     try:
         return resp.json() if resp.text else {}
     except Exception:
-        # Some ClickUp endpoints return empty body on success
         return {}
 
 
-# ===========================
 # Core task helpers
-# ===========================
-
 def create_task(name: str, description: str, priority_num: int) -> dict:
     """
     Create a task in the configured list.
@@ -92,7 +78,7 @@ def create_task(name: str, description: str, priority_num: int) -> dict:
     data = {
         "name": name or "(no subject)",
         "description": description or "",
-        "priority": int(priority_num) if priority_num else 3,  # 1=urgent,2=high,3=normal,4=low
+        "priority": int(priority_num) if priority_num else 3,
     }
     return _req("POST", f"/list/{CLICKUP_LIST_ID}/task", "create_task", data=data)
 
@@ -114,7 +100,6 @@ def _append_to_description(task_id: str, footer: str) -> None:
         sep = "\n\n" if desc and not desc.endswith("\n") else ""
         update_task_description(task_id, desc + sep + footer)
     except ClickUpHTTPError:
-        # Best effort; ignore on failure
         pass
 
 
@@ -128,10 +113,7 @@ def append_tags_note(task_id: str, failed_tags: list[str]) -> None:
     _append_to_description(task_id, foot)
 
 
-# ===========================
 # Tags
-# ===========================
-
 def _ensure_tag_exists(tag: str) -> None:
     """
     Try to create a tag at team scope if it doesn't exist.
@@ -143,7 +125,6 @@ def _ensure_tag_exists(tag: str) -> None:
     try:
         _req("POST", f"/team/{CLICKUP_TEAM_ID}/tag", "ensure_tag_exists", data={"tag": tag})
     except ClickUpHTTPError:
-        # Ignore if already exists or forbidden by workspace policy
         pass
 
 
@@ -162,10 +143,8 @@ def add_tags(task_id: str, tags: list[str]) -> list[str]:
         name = str(tg).strip()
         if not name:
             continue
-        # Best-effort ensure it exists (some workspaces require pre-existing tags)
         _ensure_tag_exists(name)
         try:
-            # Attach to task
             _req("POST", f"/task/{task_id}/tag/{requests.utils.quote(name)}", "add_tag_to_task")
         except ClickUpHTTPError:
             failed.append(name)
@@ -173,10 +152,7 @@ def add_tags(task_id: str, tags: list[str]) -> list[str]:
     return failed
 
 
-# ===========================
 # Custom fields (dropdown)
-# ===========================
-
 def get_field_options_for_list(list_id: str, field_id: str) -> list[dict]:
     """
     Return list of options for a given custom dropdown field in a list.
@@ -187,9 +163,7 @@ def get_field_options_for_list(list_id: str, field_id: str) -> list[dict]:
     if cache_key in _FIELD_OPTIONS_CACHE:
         return _FIELD_OPTIONS_CACHE[cache_key]
 
-    # The API returns a dictionary like {"fields": [...]}, so we get it.
     response_data = _req("GET", f"/list/{list_id}/field", "get_list_fields")
-    # THE FIX IS HERE: We extract the list from the "fields" key.
     fields = response_data.get("fields", [])
     
     options: list[dict] = []
@@ -197,7 +171,6 @@ def get_field_options_for_list(list_id: str, field_id: str) -> list[dict]:
         if str(f.get("id")) == str(field_id):
             cfg = f.get("type_config") or {}
             for opt in (cfg.get("options") or []):
-                # opt has {"id": "...", "label": "...", ...} OR {"id","name"} depending on API variant
                 label = opt.get("label") or opt.get("name") or ""
                 options.append({"id": opt.get("id"), "name": label})
             break
@@ -217,12 +190,10 @@ def _resolve_dropdown_option(list_id: str, field_id: str, requested_label: str) 
         return None, False, ""
 
     opts = get_field_options_for_list(list_id, field_id)
-    # Case-insensitive exact match
     for o in opts:
         if (o.get("name") or "").strip().casefold() == label.casefold():
             return o.get("id"), True, o.get("name") or label
 
-    # Light fuzzy: startswith, then contains
     for o in opts:
         nm = (o.get("name") or "")
         if nm.lower().startswith(label.lower()) or label.lower().startswith(nm.lower()):
@@ -232,7 +203,6 @@ def _resolve_dropdown_option(list_id: str, field_id: str, requested_label: str) 
         if label.lower() in nm.lower():
             return o.get("id"), False, nm
 
-    # No match
     return None, False, label
 
 
@@ -251,14 +221,11 @@ def set_dropdown_value(task_id: str, field_id: str, requested_label: str) -> tup
     meta: dict[str, t.Any] = {"requested": requested_label, "option_id": option_id, "exact": exact}
 
     if option_id is None:
-        # We can't write a value ClickUp doesn't have. Return ok=True (no exception) but not exact.
         return True, False, chosen or requested_label, meta
 
-    # PUT /task/{task_id}/field/{field_id} with {"value": <option_id>}
     data = {"value": option_id}
     _req("PUT", f"/task/{task_id}/field/{field_id}", "set_dropdown_value", data=data)
 
-    # If ClickUp accepted the request, treat as ok=True even if it was a no-op (already same value)
     return True, exact, chosen, meta
 
 def verify_custom_fields():

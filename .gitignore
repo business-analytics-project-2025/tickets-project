@@ -2,5 +2,4 @@
 *.venv-311
 *.pt
 *.csv
-*.json
 *.env

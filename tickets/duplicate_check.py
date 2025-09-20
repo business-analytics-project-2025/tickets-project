@@ -1,4 +1,3 @@
-# tickets/duplicate_check.py
 import hashlib, json, time
 from pathlib import Path
 from typing import Tuple
@@ -29,7 +28,6 @@ def is_duplicate(hash_str: str) -> bool:
     entry = cache.get(hash_str)
     if not entry:
         return False
-    # TTL expiry
     if _now() - entry.get("ts", 0) > TTL_SECONDS:
         del cache[hash_str]
         _save_cache(cache)
