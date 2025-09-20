@@ -1,4 +1,3 @@
-# tools.py
 import json
 import time
 from langchain.agents import tool
@@ -51,7 +50,6 @@ def create_clickup_task(json_input_str: str) -> str:
         if not task_id:
             return json.dumps({"ok": False, "reason": "ClickUp API did not return a task ID", "response": task})
 
-        # Add a short delay to prevent API race conditions
         time.sleep(1) 
 
         if ticket_type:

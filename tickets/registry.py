@@ -1,4 +1,3 @@
-# tickets/registry.py
 import json
 import threading
 from pathlib import Path
@@ -8,14 +7,13 @@ import numpy as np
 import torch
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
-# Per-task model config (backbones, filenames, device, etc.)
 from .config import MODEL_ASSETS_DIR, FILES, DEVICE, USE_FAST, DO_LOWER
 
 # ---- Globals (lazy, thread-safe) ----
-_tokenizers: Dict[str, AutoTokenizer] = {}  # task -> tokenizer
-_models: Dict[str, AutoModelForSequenceClassification] = {}  # task -> model
-_labels: Dict[str, List[str]] = {}  # task -> label list
-_thresholds: Optional[np.ndarray] = None  # for tags only
+_tokenizers: Dict[str, AutoTokenizer] = {}
+_models: Dict[str, AutoModelForSequenceClassification] = {}
+_labels: Dict[str, List[str]] = {}
+_thresholds: Optional[np.ndarray] = None
 
 _loaded: bool = False
 _load_lock = threading.Lock()
@@ -54,32 +52,19 @@ def _load_thresholds(path: Path) -> np.ndarray:
         raise ValueError(f"Thresholds must be 1-D list/array: {path}")
     return arr
 
-
-# tickets/registry.py
-# ... (imports and other functions are unchanged) ...
-
-# tickets/registry.py
-
 def _load_model(task: str, num_labels: int, multilabel: bool, weights_path: Path):
     """Instantiate the correct backbone per task and load fine-tuned head weights."""
     base = FILES[task]["base_model"]
-    # 1. Create the correct model CONFIGURATION with the right number of labels.
     cfg = AutoConfig.from_pretrained(
         base,
         num_labels=num_labels,
         problem_type="multi_label_classification" if multilabel else "single_label_classification",
     )
     
-    # 2. Create the model's empty ARCHITECTURE from the configuration.
-    #    This creates the model scaffold with randomly initialized weights.
     model = AutoModelForSequenceClassification.from_config(cfg)
 
-    # 3. Load the state dict from your .pt file, which contains the
-    #    weights for the ENTIRE fine-tuned model.
     state = torch.load(weights_path, map_location="cpu")
 
-    # 4. Load your fine-tuned weights into the empty scaffold.
-    #    This now works because the architecture and the state dict match perfectly.
     model.load_state_dict(state, strict=True)
     
     print(f"✅ Successfully loaded full model weights for task '{task}'.")
@@ -104,7 +89,6 @@ def ensure_loaded():
         for task, spec in FILES.items():
             labels_path = _assets_path(spec["labels"])
             _labels[task] = _load_json_list(labels_path)
-            # touch tokenizer so it is ready for parallel calls
             get_tokenizer(task)
 
         # 2) Models

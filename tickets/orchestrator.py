@@ -1,10 +1,8 @@
-# tickets/orchestrator.py
 import os
 import asyncio
 from typing import Dict
 
 from .contracts import FinalPrediction, CombinedPredictionError
-# This import has been updated from .agents to .ml_models
 from .ml_models import (
     IntakeAgent,
     PreprocessAgent,
@@ -16,7 +14,6 @@ from .ml_models import (
 from .registry import ensure_loaded
 
 # ---- Tunables ----
-# DeBERTa-v3-large on CPU can exceed 8s; make it configurable.
 AGENT_TIMEOUT_SEC = float(os.getenv("AGENT_TIMEOUT_SEC", "30"))
 RETRY_ONCE = True
 
@@ -32,29 +29,23 @@ class Orchestrator:
 
     async def _call_with_retry(self, fn, *args):
         async def _once():
-            # Run blocking model call in a thread to avoid blocking the event loop
             return await asyncio.to_thread(fn, *args)
 
         try:
             return await asyncio.wait_for(_once(), timeout=AGENT_TIMEOUT_SEC)
         except asyncio.TimeoutError:
-            # Retry won't help if we already hit the timeout; fail fast with clear message
             raise RuntimeError("timeout")
         except Exception:
             if not RETRY_ONCE:
                 raise
-            # One retry (fresh thread)
             return await asyncio.wait_for(_once(), timeout=AGENT_TIMEOUT_SEC)
 
     async def predict(self, subject: str, body: str) -> FinalPrediction:
-        # Intake + light preprocess (no tokenization here; each agent tokenizes itself)
         ticket = self.intake.handle(subject, body)
         ticket = self.pre.handle(ticket)
 
-        # Ensure all tokenizers/models are fully loaded before parallel calls
         ensure_loaded()
 
-        # Fan-out to specialist agents
         tasks = {
             "tags": self._call_with_retry(self.tags.handle, ticket),
             "department": self._call_with_retry(self.dept.handle, ticket),
@@ -62,10 +53,8 @@ class Orchestrator:
             "priority": self._call_with_retry(self.prio.handle, ticket),
         }
 
-        # Gather results; do not raise immediately so we can attach which agent failed
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-        # Fail-fast with clear agent + cause
         for (name, _), res in zip(tasks.items(), results):
             if isinstance(res, Exception):
                 raise CombinedPredictionError(
