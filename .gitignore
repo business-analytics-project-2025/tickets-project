@@ -1,5 +1,4 @@
 *.venv
 *.venv-311
 *.pt
-*.csv
 *.env

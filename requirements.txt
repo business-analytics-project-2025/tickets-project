@@ -1,19 +1,13 @@
-# requirements.txt
-# Core ML
+matplotlib
+scikit-learn
 torch
 transformers
 numpy
 sentencepiece
-
-# Agent Framework
 langchain
 langchain-community
-langchain-ollama  # <-- NEW
+langchain-ollama
 pydantic
-
-# Web & UI
 streamlit
-
-# Utilities
 requests
 python-dotenv
